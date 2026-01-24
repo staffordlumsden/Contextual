@@ -1,0 +1,18 @@
+# Core dependencies
+ollama
+pandas
+python-docx
+PyPDF2
+rich
+pyfiglet
+pick
+chromadb
+prompt_toolkit
+openpyxl
+
+# Optional performance optimisations
+numba          # JIT compilation for numerical tasks
+polars         # High-performance DataFrame alternative to pandas
+orjson         # Fast JSON parsing/serialization
+uvloop         # Faster asyncio event loop on Unix
+pydantic       # Data validation & parsing
