@@ -1,4 +1,4 @@
-# Contextual2 - Optimised CLI for Ollama
+# Contextual - Optimised CLI for Ollama
 
 **Version:** 3.3.3 (24 January 2026)  
 **Author:** Stafford Lumsden  
