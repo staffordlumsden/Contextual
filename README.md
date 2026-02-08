@@ -7,6 +7,29 @@ Welcome to **Contextual**, a powerful, feature rich command line interface (CLI)
 
 ---
 
+## Install
+
+1. Download/clone the repo
+2. On macOS make `setup.sh` executable
+```bash
+chmod +x /path/to/setup.sh
+``` 
+3. Run 
+```bash
+./setup.sh
+```
+This will download and install dependencies 
+
+4. Either make `run_chatbot.sh` executable and run it, or use 
+ ```bash
+   python contextual2.py
+ ```
+5. Add to PATH as needed.
+
+Do something similar on Windows?
+
+---
+
 ## Features
 
 - 🎛️ **Interactive CLI**: Rich, TUI-style interface with multi-line prompt input, slash commands, and hotkeys.
@@ -31,7 +54,7 @@ Welcome to **Contextual**, a powerful, feature rich command line interface (CLI)
 
 ---
 
-## Getting Started
+## Full Install
 
 1. **Install Dependencies:**
    ```bash
