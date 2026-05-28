@@ -122,19 +122,41 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')  
   
 console = Console()  
+DEFAULT_FIGLET_FONT = "4max"
+FIGLET_FONT_ENV = "CONTEXTUAL_FIGLET_FONT"
 IMAGE_MODEL = "x/flux2-klein:9b"  
 IMAGE_DEFAULT_WIDTH = 1024  
 IMAGE_DEFAULT_HEIGHT = 1024  
   
   
-def print_banner():  
+def resolve_figlet_font(font_name):
+    """Return a pyfiglet font name, matching case-insensitively when needed."""
+    fallback_font = DEFAULT_FIGLET_FONT
+    try:
+        fonts = pyfiglet.FigletFont.getFonts()
+    except Exception:
+        return fallback_font
+
+    requested_font = (font_name or fallback_font).strip()
+    if requested_font in fonts:
+        return requested_font
+
+    font_lookup = {font.lower(): font for font in fonts}
+    return font_lookup.get(requested_font.lower(), fallback_font if fallback_font in fonts else "standard")
+
+
+def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
     """Prints a colorful, responsive Figlet banner for the chatbot."""  
     console.print("\n\n")  
     width = console.width  
     if width < 80:  # Threshold for when to switch to a simpler banner  
         console.print(Panel(Align.center("Contextual"), style="bold white", border_style="white"))  
     else:  
-        banner_text = pyfiglet.figlet_format("Contextual", font="4Max", width=int(width * 0.9))  
+        resolved_font = resolve_figlet_font(figlet_font)
+        try:
+            banner_text = pyfiglet.figlet_format("Contextual", font=resolved_font, width=int(width * 0.9))
+        except pyfiglet.FontNotFound:
+            banner_text = pyfiglet.figlet_format("Contextual", font="standard", width=int(width * 0.9))
         lines = banner_text.split('\n')  
         rainbow_colors = [  
             "bold bright_red",  
@@ -1258,13 +1280,23 @@ def main():
     parser = argparse.ArgumentParser(description="A RAG chatbot that answers questions based on a provided document.")  
     parser.add_argument("file_path", nargs='?', default=None, help="The absolute path to the document file.")  
     parser.add_argument("-q", "--question", help="A question to ask the chatbot non-interactively.")  
-    args = parser.parse_args()  
-  
+    parser.add_argument(
+        "--figlet-font",
+        default=os.environ.get(FIGLET_FONT_ENV, DEFAULT_FIGLET_FONT),
+        help=f"Pyfiglet font to use for the banner. Defaults to {FIGLET_FONT_ENV} or '{DEFAULT_FIGLET_FONT}'.",
+    )
+    parser.add_argument("--list-figlet-fonts", action="store_true", help="List available pyfiglet fonts and exit.")
+    args = parser.parse_args()
+
+    if args.list_figlet_fonts:
+        console.print("\n".join(pyfiglet.FigletFont.getFonts()))
+        return
+
     is_interactive = sys.stdout.isatty() and not args.question  
     ollama_parameters = {}  
   
     while True:  
-        print_banner()  
+        print_banner(args.figlet_font)
         start_time = time.time()  
           
         # Mode selection  

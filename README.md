@@ -28,6 +28,25 @@ This will download and install dependencies
 
 Do something similar on Windows?
 
+### Banner Font
+
+Contextual uses `pyfiglet` for the startup banner. The default font is `4max`.
+
+Use any bundled pyfiglet font with:
+```bash
+./run_chatbot.sh --figlet-font slant
+```
+
+Or set it with an environment variable:
+```bash
+CONTEXTUAL_FIGLET_FONT=slant ./run_chatbot.sh
+```
+
+List available fonts with:
+```bash
+./run_chatbot.sh --list-figlet-fonts
+```
+
 ---
 
 ## Features
