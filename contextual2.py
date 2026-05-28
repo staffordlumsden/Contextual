@@ -89,8 +89,8 @@ OLLAMA_PARAMETER_PRESETS = {
     },  
 }  
   
-# Create a reusable session  
-session = PromptSession()  
+# Create the prompt session lazily so non-interactive commands stay quiet.
+session = None
   
 # Setup key bindings for multiline input  
 bindings = KeyBindings()  
@@ -562,6 +562,9 @@ def resolve_image_model(preferred_model):
   
 def get_multiline_input():  
     """Gets multi-line input from the user using prompt_toolkit."""  
+    global session
+    if session is None:
+        session = PromptSession()
     return session.prompt(  
         "> ",  
         placeholder="Enter your prompt. Press [Meta+Enter] or [Esc] then [Enter] to submit.",  
