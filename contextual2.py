@@ -41,6 +41,16 @@ from prompt_toolkit.application import get_app
 import threading  
 import queue
 
+try:
+    from chonkie import RecursiveChunker
+    from chonkie.refinery import OverlapRefinery
+except ImportError:
+    RecursiveChunker = None
+    OverlapRefinery = None
+
+CHUNK_SIZE = 4000
+CHUNK_OVERLAP = 400
+
 # --- Ollama embeddings compatibility helper ---
 def embed_text(model: str, text: str):
     """
@@ -53,6 +63,15 @@ def embed_text(model: str, text: str):
     except TypeError:
         # Older clients
         return ollama.embeddings(model=model, prompt=text)
+
+def embedding_input(model: str, text: str, purpose: str) -> str:
+    """Format text for embedding models that benefit from task-specific prompts."""
+    if model and "embeddinggemma" in model.lower():
+        if purpose == "document":
+            return f"task: document embedding | text: {text}"
+        if purpose == "query":
+            return f"task: query embedding | query: {text}"
+    return text
     
 VALID_OLLAMA_PARAMETERS = {  
     "seed": int,  
@@ -171,7 +190,7 @@ def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
             console.print(Align.center(f"[{color}]{line}[/{color}]"))  
       
     console.print()  
-    console.print(Align.center(Text("©2026 Stafford Lumsden v. 3.3.3 (24 January 2026)", style="white")), highlight=False)  
+    console.print(Align.center(Text("©2026 Stafford Lumsden v. 4.0 (01 July 2026)", style="white")), highlight=False)
     console.print("\n\n")  
     console.print(Panel(Align.center("Welcome to Contextual, a powerful, feature rich command line interface (CLI) designed to interact with locally deployed large language models (LLMs) run with Ollama 14.3 and above. Image generation implemented Jan '26"), style="bold white", border_style="white"))  
   
@@ -309,8 +328,23 @@ def read_file_content(file_path):
     else:  
         raise ValueError("Unsupported file type. Please use .csv, .xlsx, .txt, .md, .docx, or .pdf.")  
 
-# EDIT: add a simple overlapping chunker instead of split('\n\n')
-def chunk_text(txt, size=4000, overlap=400):
+# EDIT: use Chonkie's recursive chunker with overlap for better RAG boundaries.
+def chunk_text(txt, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    if RecursiveChunker and OverlapRefinery:
+        chunker = RecursiveChunker(tokenizer="character", chunk_size=size)
+        chunks = chunker(txt)
+        if chunks and len(chunks) > 1 and overlap > 0:
+            refinery = OverlapRefinery(
+                tokenizer="character",
+                context_size=overlap,
+                mode="recursive",
+                method="prefix",
+                merge=True,
+                inplace=False,
+            )
+            chunks = refinery.refine(chunks)
+        return [chunk.text for chunk in chunks if chunk.text.strip()]
+
     out, i = [], 0
     n = len(txt)
     while i < n:
@@ -392,14 +426,17 @@ def create_chroma_collection(file_path, file_content, embedding_model):
         pass  
     collection = client.get_or_create_collection(collection_name)  
   
-    # EDIT: use overlapping chunker
+    # EDIT: use Chonkie-backed semantic-ish recursive chunking with overlap.
     chunks = chunk_text(file_content)  
       
     # Batch processing for embeddings  
     embeddings = []  
     for chunk in track(chunks, description="[bold green]Generating embeddings...[/bold green]"):  
         # EDIT: embeddings API uses input= not prompt=
-        response = embed_text(model=embedding_model, text=chunk)  
+        response = embed_text(
+            model=embedding_model,
+            text=embedding_input(embedding_model, chunk, "document"),
+        )
         embeddings.append(response["embedding"])  
   
     # Batch add to ChromaDB  
@@ -1133,7 +1170,10 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                 if current_mode_is_doc_chat:  
                     live.update(Text("Generating embeddings...", justify="center"), refresh=True)  
                     # EDIT: embeddings API uses input= not prompt=
-                    response = embed_text(model=embedding_model, text=user_message)  
+                    response = embed_text(
+                        model=embedding_model,
+                        text=embedding_input(embedding_model, user_message, "query"),
+                    )
                       
                     live.update(Text("Querying documents...", justify="center"), refresh=True)  
                     # EDIT: include metadatas for citation
@@ -1408,7 +1448,10 @@ def main():
             if args.question:  
                 # Non-interactive document question  
                 # EDIT: embeddings API uses input= not prompt=
-                response = embed_text(model=embedding_model, text=args.question)  
+                response = embed_text(
+                    model=embedding_model,
+                    text=embedding_input(embedding_model, args.question, "query"),
+                )
                 # EDIT: include metadatas for citation
                 results = collection.query(query_embeddings=[response["embedding"]], n_results=5, include=["documents","metadatas"])  
                 docs = results['documents'][0]  

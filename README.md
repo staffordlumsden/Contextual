@@ -1,6 +1,6 @@
 # Contextual
 
-**Version:** 3.3.3 (24 January 2026)  
+**Version:** 4.0 (01 July 2026)
 **Author:** Stafford Lumsden  
 
 Welcome to **Contextual**, a powerful, feature rich command line interface (CLI) designed to interact with locally deployed large language models (LLMs) run with Ollama 14.3 and above. Image generation implemented Jan '26.
@@ -53,7 +53,7 @@ List available fonts with:
 
 - 🎛️ **Interactive CLI**: Rich, TUI-style interface with multi-line prompt input, slash commands, and hotkeys.
 - 📄 **Document Chat**: Load `.txt`, `.md`, `.docx`, `.pdf`, `.csv`, and `.xlsx` files, chunk them, and query with a chosen embedding model.
-- 🔍 **RAG (Retrieval-Augmented Generation)**: Automatic document chunking, embedding, storage in ChromaDB, and context-aware answers.
+- 🔍 **RAG (Retrieval-Augmented Generation)**: [Chonkie](https://github.com/feyninc/chonkie)-backed recursive document chunking, embedding, storage in ChromaDB, and context-aware answers.
 - 🧠 **EmbeddingGemma**: Optimized support for `task: query embedding | query:` and `task: document embedding | text:` prefixes to improve semantic retrieval.
 - 🔥 **Dynamic Model Switching**: Easily swap between chat models and embedding models.
 - 🧮 **Token Stats**: View token usage and latency stats for each response.
@@ -188,6 +188,12 @@ When using **EmbeddingGemma**, prepend these simple prefixes to clearly define y
   ```
 
 These prefixes improve retrieval accuracy in RAG workflows.
+
+Contextual applies these prefixes automatically for EmbeddingGemma during document ingestion and query retrieval.
+
+## Document Chunking
+
+Document chat uses [Chonkie](https://github.com/feyninc/chonkie)'s recursive chunker with overlap refinement before storing chunks in ChromaDB. This keeps chunks closer to natural paragraph and sentence boundaries while preserving cross-chunk context for retrieval. Chonkie runs automatically in the background when a document is loaded; users do not need to run a separate command.
 
 ---
 
