@@ -194,9 +194,9 @@ def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
             console.print(Align.center(f"[{color}]{line}[/{color}]"))  
       
     console.print()  
-    console.print(Align.center(Text("©2026 Stafford Lumsden v. 4.5 (02 July 2026)", style="white")), highlight=False)
+    console.print(Align.center(Text("©2026 Stafford Lumsden v4.5.1 (02 July 2026)", style="white")), highlight=False)
     console.print("\n\n")  
-    console.print(Panel(Align.center("Welcome to Contextual, a powerful, feature rich command line interface (CLI) designed to interact with locally deployed large language models (LLMs) run with Ollama 14.3 and above. Image generation implemented Jan '26"), style="bold white", border_style="white"))  
+    console.print(Panel(Align.center("Welcome to Contextual, a feature rich CLI for interacting with local Large Language Models deployed via Ollama v. 30 and above. Speed optimisation and Windows support added July 2026)"), style="bold white", border_style="white"))  
   
 def print_help():  
     """Prints a responsive, color-coded help message with available commands."""  
@@ -850,9 +850,13 @@ def generate_images(model_name, prompt, options):
     with tempfile.TemporaryDirectory(prefix="contextual_images_") as tmpdir:  
         paths = generate_images_cli(model_name, prompt, tmpdir, options)  
     return [], paths  
+
+def powershell_quote(value):
+    """Quote a string for use as a PowerShell single-quoted literal."""
+    return "'" + str(value).replace("'", "''") + "'"
   
 def launch_external_terminal_image(prompt, model_name, options, save_dir):  
-    """Open a new Terminal window to run ollama image generation in the shell."""  
+    """Open a platform terminal window to run ollama image generation in the shell."""  
     args = ["ollama", "run", model_name, "--verbose"]  
     if options.get("width"):  
         args += ["--width", str(options["width"])]  
@@ -863,18 +867,56 @@ def launch_external_terminal_image(prompt, model_name, options, save_dir):
     if options.get("seed") is not None:  
         args += ["--seed", str(options["seed"])]  
     args.append(prompt)  
-  
-    cmd = " ".join(shlex.quote(a) for a in args)  
-    terminal_cmd = f"cd {shlex.quote(save_dir)}; {cmd}"  
-    terminal_cmd = terminal_cmd.replace('"', '\\"')  
-  
-    try:  
-        subprocess.run(  
-            ["osascript", "-e", f'tell application "Terminal" to do script "{terminal_cmd}"'],  
-            check=False,  
-        )  
-        return True  
-    except Exception:  
+
+    try:
+        if sys.platform == "darwin":
+            cmd = " ".join(shlex.quote(a) for a in args)
+            terminal_cmd = f"cd {shlex.quote(save_dir)}; {cmd}"
+            terminal_cmd = terminal_cmd.replace('"', '\\"')
+            subprocess.run(
+                ["osascript", "-e", f'tell application "Terminal" to do script "{terminal_cmd}"'],
+                check=False,
+            )
+            return True
+
+        if os.name == "nt":
+            ps_args = " ".join(powershell_quote(a) for a in args)
+            ps_command = (
+                f"Set-Location -LiteralPath {powershell_quote(save_dir)}; "
+                f"& {ps_args}"
+            )
+            subprocess.Popen(
+                [
+                    "cmd",
+                    "/c",
+                    "start",
+                    "Contextual Image Generation",
+                    "powershell",
+                    "-NoExit",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    ps_command,
+                ],
+                cwd=save_dir,
+            )
+            return True
+
+        cmd = " ".join(shlex.quote(a) for a in args)
+        terminal_cmd = f"cd {shlex.quote(save_dir)}; {cmd}; printf '\\nPress Enter to close...'; read _"
+        terminal_candidates = [
+            ["x-terminal-emulator", "-e", "bash", "-lc", terminal_cmd],
+            ["gnome-terminal", "--", "bash", "-lc", terminal_cmd],
+            ["konsole", "-e", "bash", "-lc", terminal_cmd],
+            ["xfce4-terminal", "-e", f"bash -lc {shlex.quote(terminal_cmd)}"],
+            ["xterm", "-e", "bash", "-lc", terminal_cmd],
+        ]
+        for candidate in terminal_candidates:
+            if shutil.which(candidate[0]):
+                subprocess.Popen(candidate, cwd=save_dir)
+                return True
+        return False
+    except Exception:
         return False  
   
 def parse_image_set_command(user_message, image_state):  
@@ -955,10 +997,10 @@ def handle_image_generation():
                 existing = {f for f in os.listdir(save_dir) if f.lower().endswith(".png")}  
                 launched = launch_external_terminal_image(user_message, resolved_model, options, save_dir)  
                 if not launched:  
-                    console.print(Panel("[bold red]Failed to launch Terminal for image generation.[/bold red]"))  
+                    console.print(Panel("[bold red]Failed to launch a terminal for image generation.[/bold red]"))  
                     continue  
   
-                console.print(Panel("Terminal opened. Generate the image there. Press Enter here when it finishes to import.", style="bold yellow"))  
+                console.print(Panel("A terminal window opened. Generate the image there. Press Enter here when it finishes to import.", style="bold yellow"))  
                 Prompt.ask("")  
   
                 new_files = []  

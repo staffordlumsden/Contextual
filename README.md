@@ -1,18 +1,22 @@
 # Contextual
 
-**Version:** v. 4.5 (02 July 2026)
+**Version:** v4.5.1 (02 July 2026)
 **Author:** Stafford Lumsden  
 
-Welcome to **Contextual**, a powerful, feature rich command line interface (CLI) designed to interact with locally deployed large language models (LLMs) run with Ollama 14.3 and above. Image generation implemented Jan '26.
+Welcome to **Contextual**, a feature rich CLI for interacting with local Large Language Models deployed via Ollama v. 30 and above. Speed optimisation and Windows support added July 2026)
 
 > **Speed note:** Contextual now warms the selected chat model on startup/model selection and keeps it alive for faster first-token response times. This moves the cold model-load wait before the first user prompt. Disable this behaviour with `CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh`.
+
+> **Windows support note:** Contextual now includes PowerShell setup and runner scripts (`setup_windows.ps1` and `run_chatbot.ps1`). Chat, RAG, CSV, and image generation are intended to run on Windows with Ollama for Windows; image generation opens PowerShell on Windows, Terminal on macOS, and a detected terminal emulator on Linux.
 
 ---
 
 ## Install
 
+### macOS and Linux
+
 1. Download/clone the repo
-2. On macOS make `setup.sh` executable
+2. Make `setup.sh` executable
 ```bash
 chmod +x /path/to/setup.sh
 ``` 
@@ -28,7 +32,23 @@ This will download and install dependencies
  ```
 5. Add to PATH as needed.
 
-Do something similar on Windows?
+### Windows
+
+1. Download/clone the repo and open PowerShell in the project folder.
+2. If PowerShell blocks local scripts, allow them for the current session:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+3. Run setup:
+```powershell
+.\setup_windows.ps1
+```
+4. Run Contextual:
+```powershell
+.\run_chatbot.ps1
+```
+
+The Windows setup script creates `venv`, installs dependencies, and skips Unix-only `uvloop`.
 
 ### Banner Font
 
@@ -61,7 +81,7 @@ List available fonts with:
 - 🧮 **Token Stats and Analytics**: View session stats with `/stats`, and toggle per-response Ollama metrics with `/set verbose`.
 - 📝 **Conversation Saving**: Export chats in Markdown or plain text.
 - 🧩 **CSV Cleaning Mode**: Automatically clean and reformat CSVs for model-friendly analysis.
-- 🖼️ **Image Generation**: Opens a new Terminal window to run `ollama run x/flux2-klein:9b` with your prompt and saves images to the selected folder. After generation, return to Contextual and press Enter to import and list the new PNGs.
+- 🖼️ **Image Generation**: Opens a platform terminal window to run `ollama run x/flux2-klein:9b` with your prompt and saves images to the selected folder. After generation, return to Contextual and press Enter to import and list the new PNGs.
 
 ---
 
@@ -81,6 +101,8 @@ List available fonts with:
    ```bash
    pip install -r requirements.txt
    ```
+
+   On Windows, prefer `.\setup_windows.ps1` because it skips Unix-only `uvloop`.
 
 2. **Pull Models:**
    ```bash
@@ -154,6 +176,13 @@ Contextual warms the selected chat model before the first prompt and after `/swi
 CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh
 ```
 
+On Windows PowerShell:
+
+```powershell
+$env:CONTEXTUAL_PRELOAD_CHAT_MODEL="0"
+.\run_chatbot.ps1
+```
+
 Use `/set verbose` to toggle an Ollama metrics box under each model response. The metrics include:
 
 - First chunk time
@@ -174,11 +203,11 @@ Use `/set verbose` to toggle an Ollama metrics box under each model response. Th
 #### How Image Generation Works
 1. Select **Image generation** from the startup mode picker.
 2. Choose a folder where images should be saved.
-3. Enter a prompt; Contextual opens a new Terminal window and runs:
+3. Enter a prompt; Contextual opens a platform terminal window and runs:
    ```bash
    ollama run x/flux2-klein:9b --verbose --width <n> --height <n> --steps <n> --seed <n> "your prompt"
    ```
-4. When the Terminal finishes and saves the image, return to Contextual and press Enter.
+4. When the terminal finishes and saves the image, return to Contextual and press Enter.
 5. Contextual scans the selected folder and lists newly created PNG files.
 
 ### Input
