@@ -1,9 +1,11 @@
 # Contextual
 
-**Version:** 4.0 (01 July 2026)
+**Version:** v. 4.5 (02 July 2026)
 **Author:** Stafford Lumsden  
 
 Welcome to **Contextual**, a powerful, feature rich command line interface (CLI) designed to interact with locally deployed large language models (LLMs) run with Ollama 14.3 and above. Image generation implemented Jan '26.
+
+> **Speed note:** Contextual now warms the selected chat model on startup/model selection and keeps it alive for faster first-token response times. This moves the cold model-load wait before the first user prompt. Disable this behaviour with `CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh`.
 
 ---
 
@@ -56,7 +58,7 @@ List available fonts with:
 - 🔍 **RAG (Retrieval-Augmented Generation)**: [Chonkie](https://github.com/feyninc/chonkie)-backed recursive document chunking, embedding, storage in ChromaDB, and context-aware answers.
 - 🧠 **EmbeddingGemma**: Optimized support for `task: query embedding | query:` and `task: document embedding | text:` prefixes to improve semantic retrieval.
 - 🔥 **Dynamic Model Switching**: Easily swap between chat models and embedding models.
-- 🧮 **Token Stats**: View token usage and latency stats for each response.
+- 🧮 **Token Stats and Analytics**: View session stats with `/stats`, and toggle per-response Ollama metrics with `/set verbose`.
 - 📝 **Conversation Saving**: Export chats in Markdown or plain text.
 - 🧩 **CSV Cleaning Mode**: Automatically clean and reformat CSVs for model-friendly analysis.
 - 🖼️ **Image Generation**: Opens a new Terminal window to run `ollama run x/flux2-klein:9b` with your prompt and saves images to the selected folder. After generation, return to Contextual and press Enter to import and list the new PNGs.
@@ -111,6 +113,8 @@ List available fonts with:
 | `/prompt`            | Set a custom system prompt for the session               |
 | `/set think`         | Enable thinking mode for supported models                |
 | `/set nothink`       | Disable thinking mode                                    |
+| `/set verbose`       | Toggle per-response Ollama analytics                    |
+| `/set verbose on/off`| Explicitly enable or disable Ollama analytics            |
 
 ### File
 | Command              | Description                                               |
@@ -141,6 +145,23 @@ List available fonts with:
 | `/set cold`          | Apply the 'accuracy-cold' parameter preset               |
 | `/set balanced`      | Apply the 'balanced' parameter preset                    |
 | `/set warm`          | Apply the 'creative-warm' parameter preset               |
+
+### Speed and Analytics
+
+Contextual warms the selected chat model before the first prompt and after `/switch`, using Ollama keep-alive to reduce cold-start TTFT on the first real response. To skip model preloading:
+
+```bash
+CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh
+```
+
+Use `/set verbose` to toggle an Ollama metrics box under each model response. The metrics include:
+
+- First chunk time
+- TTFT
+- Input and output token counts
+- Prompt eval time and prompt eval rate
+- Generation time and output rate
+- Ollama total time
 
 ### Image Generation
 | Command              | Description                                               |

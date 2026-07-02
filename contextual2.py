@@ -146,6 +146,10 @@ FIGLET_FONT_ENV = "CONTEXTUAL_FIGLET_FONT"
 IMAGE_MODEL = "x/flux2-klein:9b"  
 IMAGE_DEFAULT_WIDTH = 1024  
 IMAGE_DEFAULT_HEIGHT = 1024  
+# Keep live streaming smooth without redrawing the terminal on every model chunk.
+STREAM_RENDER_INTERVAL_SECONDS = 0.25
+MODEL_KEEP_ALIVE = "30m"
+PRELOAD_CHAT_MODEL_ENV = "CONTEXTUAL_PRELOAD_CHAT_MODEL"
   
   
 def resolve_figlet_font(font_name):
@@ -190,7 +194,7 @@ def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
             console.print(Align.center(f"[{color}]{line}[/{color}]"))  
       
     console.print()  
-    console.print(Align.center(Text("©2026 Stafford Lumsden v. 4.0 (01 July 2026)", style="white")), highlight=False)
+    console.print(Align.center(Text("©2026 Stafford Lumsden v. 4.5 (02 July 2026)", style="white")), highlight=False)
     console.print("\n\n")  
     console.print(Panel(Align.center("Welcome to Contextual, a powerful, feature rich command line interface (CLI) designed to interact with locally deployed large language models (LLMs) run with Ollama 14.3 and above. Image generation implemented Jan '26"), style="bold white", border_style="white"))  
   
@@ -221,6 +225,7 @@ def print_help():
         ("/prompt", "Set a custom system prompt for the session"),  
         ("/set think", "Enable thinking mode for supported models"),  
         ("/set nothink", "Disable thinking mode"),  
+        ("/set verbose", "Toggle Ollama response analytics"),  
     ])  
   
     # File Section  
@@ -399,6 +404,38 @@ def select_chat_model(is_interactive):
     except Exception as e:  
         console.print(Panel(f"[bold red]Error fetching chat models: {e}[/bold red]"))  
         return None  
+
+def should_preload_chat_model():
+    """Return whether interactive chat should warm the model before the first prompt."""
+    value = os.environ.get(PRELOAD_CHAT_MODEL_ENV, "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+def warm_chat_model(model_name):
+    """Load the selected chat model into Ollama so the first real prompt starts warm."""
+    if not should_preload_chat_model():
+        return
+
+    start = time.time()
+    try:
+        with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:
+            live.update(
+                Group(
+                    Rule(title=f"[bold green]{model_name}[/bold green]", style="white"),
+                    Align.center(Spinner("dots", text=Text("Warming model...", style="yellow"))),
+                    Rule(title=Text("Preparing first response", style="bold yellow"), style="white", align="right"),
+                ),
+                refresh=True,
+            )
+            ollama.generate(
+                model=model_name,
+                prompt="",
+                options={"num_predict": 0},
+                stream=False,
+                keep_alive=MODEL_KEEP_ALIVE,
+            )
+        console.print(Panel(f"Model warmed in {time.time() - start:.2f}s.", title="[bold green]Ready[/bold green]", border_style="green", expand=False))
+    except Exception as e:
+        console.print(Panel(f"[bold yellow]Model warm-up skipped: {e}[/bold yellow]", title="[yellow]Warm-up Warning[/yellow]", expand=False))
   
 def sanitize_collection_name(name):  
     """Sanitizes a string to be a valid ChromaDB collection name."""  
@@ -989,6 +1026,7 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
     start_time = time.time()  
     user_system_prompt = None  
     thinking_enabled = False  
+    verbose_enabled = False  
   
     # Internal state for the chat session  
     current_mode_is_doc_chat = is_document_chat  
@@ -1100,11 +1138,16 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                 command = parts[1].lower()  
                 if command == 'think':  
                     thinking_enabled = True  
-                    console.print(Panel("Thinking mode [bold green]enabled[/bold green]. Model will show its thought process if supported.", title="[yellow]Mode Changed[/yellow]"))  
+                    console.print(Panel("Thinking mode [bold green]enabled[/bold green]. Ollama will receive [bold]think=true[/bold] for supported models.", title="[yellow]Mode Changed[/yellow]"))  
                     continue  
                 elif command == 'nothink':  
                     thinking_enabled = False  
-                    console.print(Panel("Thinking mode [bold red]disabled[/bold red].", title="[yellow]Mode Changed[/yellow]"))  
+                    console.print(Panel("Thinking mode [bold red]disabled[/bold red]. Ollama will receive [bold]think=false[/bold] for supported models.", title="[yellow]Mode Changed[/yellow]"))  
+                    continue  
+                elif command == 'verbose':  
+                    verbose_enabled = not verbose_enabled  
+                    state = "[bold green]enabled[/bold green]" if verbose_enabled else "[bold red]disabled[/bold red]"  
+                    console.print(Panel(f"Ollama response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))  
                     continue  
   
                 preset_name = parts[1]  
@@ -1114,6 +1157,17 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                     console.print(Panel(params_text, title=f"[bold yellow]'{preset_name.capitalize()}' Preset Applied[/bold yellow]", border_style="yellow", style="yellow"))  
                 else:  
                     console.print(Panel(f"[bold red]Invalid preset or command: {preset_name}[/bold red]"))  
+            elif len(parts) == 3 and parts[1].lower() == "verbose":
+                value = parts[2].lower()
+                if value in {"on", "true", "yes", "1"}:
+                    verbose_enabled = True
+                elif value in {"off", "false", "no", "0"}:
+                    verbose_enabled = False
+                else:
+                    console.print(Panel("[bold red]Invalid verbose value. Use /set verbose, /set verbose on, or /set verbose off.[/bold red]"))
+                    continue
+                state = "[bold green]enabled[/bold green]" if verbose_enabled else "[bold red]disabled[/bold red]"
+                console.print(Panel(f"Ollama response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))
             elif len(parts) >= 4 and parts[1] == "parameter":  
                 _, _, param_name, param_value = parts  
                 if param_name in VALID_OLLAMA_PARAMETERS:  
@@ -1129,7 +1183,7 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                 else:  
                     console.print(Panel(f"[bold red]Invalid parameter: {param_name}[/bold red]"))  
             else:  
-                console.print(Panel("[bold red]Invalid command. Use /set <preset>, /set think, /set nothink, or /set parameter <name> <value>.[/bold red]"))  
+                console.print(Panel("[bold red]Invalid command. Use /set <preset>, /set think, /set nothink, /set verbose, or /set parameter <name> <value>.[/bold red]"))  
             continue  
   
         if user_message.lower().strip() == '/save':  
@@ -1141,6 +1195,7 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
             new_model = select_chat_model(True)  
             if new_model:  
                 chat_model = new_model  
+                warm_chat_model(chat_model)
                 console.print(Panel(f"Switched to model: [bold]{chat_model}[/bold]", title="[green]Model Switched[/green]", expand=False))  
             continue  
         if user_message.lower().strip() == '/help':  
@@ -1155,6 +1210,7 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
           
         try:  
             prompt = user_message  
+            metrics_panel = None  
               
             with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:  
                 response_start_time = time.time()  
@@ -1213,39 +1269,85 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                     refresh=True,  
                 )  
   
-                response_stream = ollama.chat(model=chat_model, messages=final_messages, options=ollama_parameters, stream=True)  
+                response_stream = ollama.chat(
+                    model=chat_model,
+                    messages=final_messages,
+                    options=ollama_parameters,
+                    stream=True,
+                    think=thinking_enabled,
+                    keep_alive=MODEL_KEEP_ALIVE,
+                )  
                   
                 full_response_content = ""  
-                thinking_text = ""  
+                api_thinking_text = ""
+                legacy_thinking_text = ""
                 final_answer = ""  
                 full_response_data = {}  
+                first_chunk_time = None
+                first_content_time = None
+                last_render_time = 0.0
   
                 for chunk in response_stream:  
-                    chunk_content = chunk['message']['content']  
+                    now = time.time()
+                    if first_chunk_time is None:
+                        first_chunk_time = now
+
+                    message_chunk = chunk.get('message', {})
+                    chunk_content = message_chunk.get('content', "") or ""
+                    chunk_thinking = message_chunk.get('thinking', "") or ""
+                    if chunk_content and first_content_time is None:
+                        first_content_time = now
+
                     full_response_content += chunk_content  
+                    api_thinking_text += chunk_thinking  
                       
                     thinking_match = re.search(r"<thinking>(.*?)</thinking>", full_response_content, re.DOTALL)  
                     if thinking_match:  
-                        thinking_text = thinking_match.group(1)  
+                        legacy_thinking_text = thinking_match.group(1)  
                         final_answer = full_response_content.replace(thinking_match.group(0), "")  
                     else:  
                         final_answer = full_response_content  
+
+                    should_render = (
+                        chunk.get('done')
+                        or first_content_time == now
+                        or now - last_render_time >= STREAM_RENDER_INTERVAL_SECONDS
+                    )
+                    if not should_render:
+                        if chunk.get('done'):
+                            full_response_data = chunk
+                        continue
   
                     render_items = []  
+                    thinking_text = "\n".join(
+                        part for part in (api_thinking_text, legacy_thinking_text) if part
+                    )
                     if thinking_text:  
                         render_items.append(Text("Thinking...", style="italic cyan"))  
                         render_items.append(Text(thinking_text, style="cyan"))  
                         render_items.append(Rule(style="cyan"))  
                       
-                    render_items.append(Markdown(final_answer))  
+                    if chunk.get('done'):
+                        render_items.append(Markdown(final_answer))
+                    else:
+                        render_items.append(Text(final_answer))
                       
                     elapsed_time = time.time() - response_start_time  
+                    timing_text = ""
+                    if verbose_enabled:
+                        timing_parts = []
+                        if first_chunk_time is not None:
+                            timing_parts.append(f"First chunk: {first_chunk_time - response_start_time:.2f}s")
+                        if first_content_time is not None:
+                            timing_parts.append(f"TTFT: {first_content_time - response_start_time:.2f}s")
+                        timing_text = f" | {' | '.join(timing_parts)}" if timing_parts else ""
                     bot_response_group = Group(  
                         Rule(title=f"[bold green]{chat_model}[/bold green]", style="white"),  
                         *render_items,  
-                        Rule(title=Text(f"Time: {elapsed_time:.2f}s", style="bold yellow"), style="white", align="right")  
+                        Rule(title=Text(f"Time: {elapsed_time:.2f}s{timing_text}", style="bold yellow"), style="white", align="right")  
                     )  
                     live.update(bot_response_group, refresh=True)  
+                    last_render_time = now
                       
                     if chunk.get('done'):  
                         full_response_data = chunk  
@@ -1255,6 +1357,37 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                     input_tokens += full_response_data.get('prompt_eval_count', 0)  
                 if 'eval_count' in full_response_data:  
                     output_tokens += full_response_data.get('eval_count', 0)  
+                if verbose_enabled and full_response_data:
+                    prompt_eval_count = full_response_data.get('prompt_eval_count')
+                    eval_count = full_response_data.get('eval_count')
+                    prompt_eval_duration = full_response_data.get('prompt_eval_duration')
+                    eval_duration = full_response_data.get('eval_duration')
+                    total_duration = full_response_data.get('total_duration')
+                    metrics = []
+                    if first_chunk_time is not None:
+                        metrics.append(f"First chunk: {first_chunk_time - response_start_time:.2f}s")
+                    if first_content_time is not None:
+                        metrics.append(f"TTFT: {first_content_time - response_start_time:.2f}s")
+                    if prompt_eval_count is not None:
+                        metrics.append(f"Input tokens evaluated: {prompt_eval_count}")
+                    if eval_count is not None:
+                        metrics.append(f"Output tokens: {eval_count}")
+                    if prompt_eval_duration:
+                        prompt_eval_seconds = prompt_eval_duration / 1_000_000_000
+                        metrics.append(f"Prompt eval: {prompt_eval_seconds:.2f}s")
+                        if prompt_eval_count is not None and prompt_eval_seconds > 0:
+                            metrics.append(f"Prompt eval rate: {prompt_eval_count / prompt_eval_seconds:.2f} tokens/s")
+                    if eval_duration:
+                        eval_seconds = eval_duration / 1_000_000_000
+                        metrics.append(f"Generation: {eval_seconds:.2f}s")
+                        if eval_count is not None and eval_seconds > 0:
+                            metrics.append(f"Output rate: {eval_count / eval_seconds:.2f} tokens/s")
+                    if total_duration:
+                        metrics.append(f"Ollama total: {total_duration / 1_000_000_000:.2f}s")
+                    if metrics:
+                        metrics_panel = Panel("\n".join(metrics), title="[bold yellow]Ollama Metrics[/bold yellow]", border_style="yellow", expand=False)
+            if metrics_panel:
+                console.print(metrics_panel)
   
         except KeyboardInterrupt:  
             console.print("\n[bold yellow]Interrupted by user. Returning to prompt.[/bold yellow]")  
@@ -1435,6 +1568,8 @@ def main():
             chat_model = select_chat_model(is_interactive)  
             if not chat_model:  
                 break  
+            if is_interactive:
+                warm_chat_model(chat_model)
   
             file_content, file_path, collection = select_and_load_file(args.file_path, embedding_model)  
             if not file_content:  
@@ -1485,6 +1620,8 @@ def main():
             chat_model = select_chat_model(is_interactive)  
             if not chat_model:  
                 break  
+            if is_interactive:
+                warm_chat_model(chat_model)
               
             console.print(Panel(f"Using model: [bold]{chat_model}[/bold]", title="[green]Ready for General Chat[/green]", expand=False))  
             should_exit = handle_chat_interaction(chat_model=chat_model, is_document_chat=False, ollama_parameters=ollama_parameters)  
