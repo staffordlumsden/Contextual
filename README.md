@@ -5,7 +5,7 @@
 
 Welcome to **Contextual**, a feature rich CLI for interacting with local and Hugging Face Large Language Models via Ollama v. 30 and above.
 
-> **New in v. 4.9:** When selecting a chat model, choose **h** to paste an Ollama Hugging Face command such as `ollama run hf.co/{username}/{repository}:{quantization}`. Contextual extracts the `hf.co/...` model reference, passes it to Ollama, and Ollama downloads/runs the model as needed.
+> **New in v. 4.9:** When selecting a chat model, choose **h** to paste an Ollama Hugging Face command such as `ollama run hf.co/{username}/{repository}:{quantization}`. Contextual extracts the `hf.co/...` model reference, normalizes pasted line breaks and quantization tag casing, pulls the model with Ollama, and then uses it for chat.
 
 > **Speed note:** Contextual now warms the selected chat model on startup/model selection and keeps it alive for faster first-token response times. This moves the cold model-load wait before the first user prompt. Disable this behaviour with `CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh`.
 
@@ -154,11 +154,17 @@ When Contextual asks you to select a chat model, local Ollama models are listed 
    ```bash
    ollama run hf.co/{username}/{repository}:{quantization}
    ```
-3. Paste the full command into Contextual. You may also paste only:
+3. Paste the full command into Contextual, then press Enter on a blank line to submit. You may also paste only:
    ```bash
    hf.co/{username}/{repository}:{quantization}
    ```
-4. Contextual validates the reference and uses it as the chat model. Ollama will download/run the model when needed.
+   Contextual also accepts `owner/repository:{quantization}` and Hugging Face URLs.
+4. Contextual validates the reference, normalizes quantization tags to uppercase, and runs `ollama pull` so the model is available through the Ollama API before chat starts.
+
+Example:
+```bash
+ollama run hf.co/Andycurrent/Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_GGUF:Q6_K
+```
 
 This option is also available from `/switch` during a chat session.
 

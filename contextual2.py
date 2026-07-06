@@ -385,23 +385,46 @@ def select_embedding_model(is_interactive):
         console.print(Panel(f"[bold red]Error fetching embedding models: {e}[/bold red]"))  
         return None  
   
+def is_huggingface_model_ref(model_name):
+    return bool(model_name and model_name.startswith(HF_MODEL_PREFIX))
+
+
 def normalize_huggingface_model_entry(raw_value):
     """Return a bare hf.co model reference from a pasted Ollama command or model ref."""
     value = (raw_value or "").strip().strip("`")
     if not value:
         return None, "No model reference entered."
 
+    value = re.sub(r"\s*/\s*", "/", value)
+    value = re.sub(r"\s*:\s*", ":", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
     try:
         tokens = shlex.split(value)
     except ValueError as exc:
         return None, f"Could not parse that command: {exc}"
 
-    candidates = [token.strip("`") for token in tokens if token.strip("`").startswith(HF_MODEL_PREFIX)]
+    candidates = []
+    for token in tokens:
+        candidate = token.strip().strip("`'\",")
+        if candidate.startswith("https://huggingface.co/"):
+            candidate = HF_MODEL_PREFIX + candidate[len("https://huggingface.co/"):]
+        elif candidate.startswith("http://huggingface.co/"):
+            candidate = HF_MODEL_PREFIX + candidate[len("http://huggingface.co/"):]
+        elif candidate.startswith("huggingface.co/"):
+            candidate = HF_MODEL_PREFIX + candidate[len("huggingface.co/"):]
+
+        candidate = re.split(r"/(?:tree|blob|resolve)/", candidate, maxsplit=1)[0]
+        if candidate.startswith(HF_MODEL_PREFIX):
+            candidates.append(candidate)
+        elif "/" in candidate and not candidate.startswith("-") and candidate not in {"ollama", "run"}:
+            candidates.append(f"{HF_MODEL_PREFIX}{candidate}")
+
     model_ref = candidates[0] if candidates else value
     model_ref = model_ref.strip().strip("`")
 
     if not model_ref.startswith(HF_MODEL_PREFIX):
-        return None, f"Model must start with {HF_MODEL_PREFIX}."
+        return None, f"Model must start with {HF_MODEL_PREFIX}, or use owner/repository:quantization."
     if any(char.isspace() for char in model_ref):
         return None, "Model reference cannot contain spaces."
 
@@ -409,9 +432,53 @@ def normalize_huggingface_model_entry(raw_value):
     if "/" not in model_path:
         return None, "Use hf.co/{username}/{repository}:{quantization}."
     if ":" not in model_path.rsplit("/", 1)[-1]:
-        return None, "Include the quantization tag after the repository, for example :Q4_K_M."
+        return None, "Include the quantization tag after the repository, for example :Q4_K_M. Copy the Ollama command from Hugging Face if unsure."
+
+    prefix, quantization = model_ref.rsplit(":", 1)
+    model_ref = f"{prefix}:{quantization.upper()}"
 
     return model_ref, None
+
+
+def ensure_huggingface_model_available(model_ref):
+    """Pull a Hugging Face model through Ollama before using it via the API."""
+    try:
+        with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:
+            live.update(
+                Group(
+                    Rule(title=f"[bold green]{model_ref}[/bold green]", style="white"),
+                    Align.center(Spinner("dots", text=Text("Pulling Hugging Face model with Ollama...", style="yellow"))),
+                    Rule(title=Text("This can take a while on first use", style="bold yellow"), style="white", align="right"),
+                ),
+                refresh=True,
+            )
+            result = subprocess.run(
+                ["ollama", "pull", model_ref],
+                text=True,
+                capture_output=True,
+            )
+    except FileNotFoundError:
+        console.print(Panel("[bold red]Ollama CLI not found. Install Ollama or add it to PATH.[/bold red]"))
+        return False
+    except Exception as exc:
+        console.print(Panel(f"[bold red]Could not prepare Hugging Face model: {exc}[/bold red]"))
+        return False
+
+    if result.returncode == 0:
+        console.print(Panel(f"Hugging Face model ready: [bold]{model_ref}[/bold]", title="[green]Model Ready[/green]", expand=False))
+        return True
+
+    output = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()
+    if len(output) > 1200:
+        output = output[-1200:]
+    console.print(Panel(
+        f"[bold red]Ollama could not pull this Hugging Face model.[/bold red]\n\n{output}\n\n"
+        f"Try the exact command from Hugging Face, for example:\n"
+        f"ollama run {model_ref}",
+        title="[bold red]Hugging Face Model Error[/bold red]",
+        border_style="red",
+    ))
+    return False
 
 
 def select_huggingface_chat_model():
@@ -421,27 +488,30 @@ def select_huggingface_chat_model():
         "1. Open the model page on Hugging Face.\n"
         "2. Copy the Ollama command, for example:\n"
         "   ollama run hf.co/{username}/{repository}:{quantization}\n"
-        "3. Paste the full command here. You may also paste only:\n"
+        "3. Paste the full command here. Press Enter on a blank line to submit.\n"
+        "   You may also paste only:\n"
         "   hf.co/{username}/{repository}:{quantization}\n\n"
-        "Contextual will pass the hf.co model reference to Ollama. Ollama will download/run the model as needed."
+        "Contextual also accepts owner/repository:quantization and normalizes quantization tags to uppercase."
     )
     console.print(Panel(instructions, title="[bold green]Hugging Face Model[/bold green]", border_style="green", expand=True))
 
     while True:
-        raw_value = Prompt.ask("Paste Hugging Face model command or reference (Enter to cancel)", default="")
+        raw_value = get_multiline_input(
+            prompt_text="hf> ",
+            placeholder="Paste ollama run hf.co/... here. Press Enter on a blank line to submit.",
+        )
         if not raw_value.strip():
             console.print(Panel("[bold yellow]Hugging Face model entry cancelled.[/bold yellow]"))
             return None
 
         model_ref, error = normalize_huggingface_model_entry(raw_value)
         if model_ref:
-            console.print(Panel(f"Using Hugging Face model: [bold]{model_ref}[/bold]", title="[green]Model Selected[/green]", expand=False))
-            return model_ref
+            if ensure_huggingface_model_available(model_ref):
+                console.print(Panel(f"Using Hugging Face model: [bold]{model_ref}[/bold]", title="[green]Model Selected[/green]", expand=False))
+                return model_ref
+            continue
 
         console.print(Panel(f"[bold red]{error}[/bold red]"))
-        retry = Prompt.ask("Try again?", choices=["y", "n"], default="y")
-        if retry.lower() != "y":
-            return None
 
 
 def select_chat_model(is_interactive):  
@@ -705,14 +775,17 @@ def resolve_image_model(preferred_model):
   
     return flux_variants[0]  
   
-def get_multiline_input():  
+def get_multiline_input(
+    prompt_text="> ",
+    placeholder="Enter your prompt. Press [Meta+Enter] or [Esc] then [Enter] to submit.",
+):
     """Gets multi-line input from the user using prompt_toolkit."""  
     global session
     if session is None:
         session = PromptSession()
     return session.prompt(  
-        "> ",  
-        placeholder="Enter your prompt. Press [Meta+Enter] or [Esc] then [Enter] to submit.",  
+        prompt_text,
+        placeholder=placeholder,
         multiline=True,  
         key_bindings=bindings,  
         prompt_continuation="... "  
