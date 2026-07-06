@@ -150,6 +150,7 @@ IMAGE_DEFAULT_HEIGHT = 1024
 STREAM_RENDER_INTERVAL_SECONDS = 0.25
 MODEL_KEEP_ALIVE = "30m"
 PRELOAD_CHAT_MODEL_ENV = "CONTEXTUAL_PRELOAD_CHAT_MODEL"
+HF_MODEL_PREFIX = "hf.co/"
   
   
 def resolve_figlet_font(font_name):
@@ -194,9 +195,9 @@ def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
             console.print(Align.center(f"[{color}]{line}[/{color}]"))  
       
     console.print()  
-    console.print(Align.center(Text("©2026 Stafford Lumsden v4.5.1 (02 July 2026)", style="white")), highlight=False)
+    console.print(Align.center(Text("©2026 Stafford Lumsden v. 4.9 (06 July 2026)", style="white")), highlight=False)
     console.print("\n\n")  
-    console.print(Panel(Align.center("Welcome to Contextual, a feature rich CLI for interacting with local Large Language Models deployed via Ollama v. 30 and above. Speed optimisation and Windows support added July 2026)"), style="bold white", border_style="white"))  
+    console.print(Panel(Align.center("Welcome to Contextual, a feature rich CLI for interacting with local and Hugging Face models via Ollama v. 30 and above. Hugging Face model entry, image generation, speed optimisation, and Windows support added July 2026."), style="bold white", border_style="white"))
   
 def print_help():  
     """Prints a responsive, color-coded help message with available commands."""  
@@ -384,20 +385,90 @@ def select_embedding_model(is_interactive):
         console.print(Panel(f"[bold red]Error fetching embedding models: {e}[/bold red]"))  
         return None  
   
+def normalize_huggingface_model_entry(raw_value):
+    """Return a bare hf.co model reference from a pasted Ollama command or model ref."""
+    value = (raw_value or "").strip().strip("`")
+    if not value:
+        return None, "No model reference entered."
+
+    try:
+        tokens = shlex.split(value)
+    except ValueError as exc:
+        return None, f"Could not parse that command: {exc}"
+
+    candidates = [token.strip("`") for token in tokens if token.strip("`").startswith(HF_MODEL_PREFIX)]
+    model_ref = candidates[0] if candidates else value
+    model_ref = model_ref.strip().strip("`")
+
+    if not model_ref.startswith(HF_MODEL_PREFIX):
+        return None, f"Model must start with {HF_MODEL_PREFIX}."
+    if any(char.isspace() for char in model_ref):
+        return None, "Model reference cannot contain spaces."
+
+    model_path = model_ref[len(HF_MODEL_PREFIX):]
+    if "/" not in model_path:
+        return None, "Use hf.co/{username}/{repository}:{quantization}."
+    if ":" not in model_path.rsplit("/", 1)[-1]:
+        return None, "Include the quantization tag after the repository, for example :Q4_K_M."
+
+    return model_ref, None
+
+
+def select_huggingface_chat_model():
+    """Prompt for an Ollama Hugging Face model reference."""
+    instructions = (
+        "Use this for an Ollama-compatible Hugging Face model that is not already listed locally.\n\n"
+        "1. Open the model page on Hugging Face.\n"
+        "2. Copy the Ollama command, for example:\n"
+        "   ollama run hf.co/{username}/{repository}:{quantization}\n"
+        "3. Paste the full command here. You may also paste only:\n"
+        "   hf.co/{username}/{repository}:{quantization}\n\n"
+        "Contextual will pass the hf.co model reference to Ollama. Ollama will download/run the model as needed."
+    )
+    console.print(Panel(instructions, title="[bold green]Hugging Face Model[/bold green]", border_style="green", expand=True))
+
+    while True:
+        raw_value = Prompt.ask("Paste Hugging Face model command or reference (Enter to cancel)", default="")
+        if not raw_value.strip():
+            console.print(Panel("[bold yellow]Hugging Face model entry cancelled.[/bold yellow]"))
+            return None
+
+        model_ref, error = normalize_huggingface_model_entry(raw_value)
+        if model_ref:
+            console.print(Panel(f"Using Hugging Face model: [bold]{model_ref}[/bold]", title="[green]Model Selected[/green]", expand=False))
+            return model_ref
+
+        console.print(Panel(f"[bold red]{error}[/bold red]"))
+        retry = Prompt.ask("Try again?", choices=["y", "n"], default="y")
+        if retry.lower() != "y":
+            return None
+
+
 def select_chat_model(is_interactive):  
     """Lists available chat models and prompts the user to select one."""  
     try:  
         models_info = ollama.list()  
         available_models = [model['model'] for model in models_info['models'] if 'embed' not in model['model']]  
-        if not available_models:  
+        if not available_models and not is_interactive:
             console.print(Panel("[bold red]No chat models found. Please install one (e.g., 'ollama pull llama2').[/bold red]"))  
             return None  
   
         if is_interactive:  
-            model_list = "\n".join(f"[yellow]{i + 1}[/yellow]: {model_name}" for i, model_name in enumerate(available_models))  
+            if available_models:
+                model_list = "\n".join(f"[yellow]{i + 1}[/yellow]: {model_name}" for i, model_name in enumerate(available_models))
+                model_list += "\n[yellow]h[/yellow]: Enter a Hugging Face model (hf.co/{username}/{repository}:{quantization})"
+            else:
+                model_list = "[yellow]h[/yellow]: Enter a Hugging Face model (hf.co/{username}/{repository}:{quantization})"
             console.print(Panel(model_list, title="[bold green]Select a Chat Model[/bold green]", expand=True))  
-            choice = IntPrompt.ask("Select a model", choices=[str(i+1) for i in range(len(available_models))])  
-            return available_models[choice - 1]  
+            while True:
+                choice = Prompt.ask("Select a model number or h", default="1" if available_models else "h").strip().lower()
+                if choice == "h":
+                    return select_huggingface_chat_model()
+                if choice.isdigit():
+                    index = int(choice)
+                    if 1 <= index <= len(available_models):
+                        return available_models[index - 1]
+                console.print(Panel("[bold red]Invalid selection. Enter a listed number or h.[/bold red]"))
         else:  
             return available_models[0]  
   

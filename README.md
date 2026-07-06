@@ -1,9 +1,11 @@
 # Contextual
 
-**Version:** v4.5.1 (02 July 2026)
+**Version:** v. 4.9 (06 July 2026)
 **Author:** Stafford Lumsden  
 
-Welcome to **Contextual**, a feature rich CLI for interacting with local Large Language Models deployed via Ollama v. 30 and above. Speed optimisation and Windows support added July 2026)
+Welcome to **Contextual**, a feature rich CLI for interacting with local and Hugging Face Large Language Models via Ollama v. 30 and above.
+
+> **New in v. 4.9:** When selecting a chat model, choose **h** to paste an Ollama Hugging Face command such as `ollama run hf.co/{username}/{repository}:{quantization}`. Contextual extracts the `hf.co/...` model reference, passes it to Ollama, and Ollama downloads/runs the model as needed.
 
 > **Speed note:** Contextual now warms the selected chat model on startup/model selection and keeps it alive for faster first-token response times. This moves the cold model-load wait before the first user prompt. Disable this behaviour with `CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh`.
 
@@ -77,7 +79,7 @@ List available fonts with:
 - 📄 **Document Chat**: Load `.txt`, `.md`, `.docx`, `.pdf`, `.csv`, and `.xlsx` files, chunk them, and query with a chosen embedding model.
 - 🔍 **RAG (Retrieval-Augmented Generation)**: [Chonkie](https://github.com/feyninc/chonkie)-backed recursive document chunking, embedding, storage in ChromaDB, and context-aware answers.
 - 🧠 **EmbeddingGemma**: Optimized support for `task: query embedding | query:` and `task: document embedding | text:` prefixes to improve semantic retrieval.
-- 🔥 **Dynamic Model Switching**: Easily swap between chat models and embedding models.
+- 🔥 **Dynamic Model Switching**: Easily swap between chat models, embedding models, and Ollama-compatible Hugging Face chat models.
 - 🧮 **Token Stats and Analytics**: View session stats with `/stats`, and toggle per-response Ollama metrics with `/set verbose`.
 - 📝 **Conversation Saving**: Export chats in Markdown or plain text.
 - 🧩 **CSV Cleaning Mode**: Automatically clean and reformat CSVs for model-friendly analysis.
@@ -111,6 +113,11 @@ List available fonts with:
    ollama pull x/flux2-klein
    ```
 
+   You can also run Ollama-compatible Hugging Face models directly from the chat model picker by selecting **h** and pasting:
+   ```bash
+   ollama run hf.co/{username}/{repository}:{quantization}
+   ```
+
 3. **Run Contextual:**
    ```bash
    python contextual2.py
@@ -137,6 +144,23 @@ List available fonts with:
 | `/set nothink`       | Disable thinking mode                                    |
 | `/set verbose`       | Toggle per-response Ollama analytics                    |
 | `/set verbose on/off`| Explicitly enable or disable Ollama analytics            |
+
+### Hugging Face Models
+
+When Contextual asks you to select a chat model, local Ollama models are listed first. Select **h** to enter a Hugging Face model.
+
+1. Open an Ollama-compatible model page on Hugging Face.
+2. Copy the Ollama command, for example:
+   ```bash
+   ollama run hf.co/{username}/{repository}:{quantization}
+   ```
+3. Paste the full command into Contextual. You may also paste only:
+   ```bash
+   hf.co/{username}/{repository}:{quantization}
+   ```
+4. Contextual validates the reference and uses it as the chat model. Ollama will download/run the model when needed.
+
+This option is also available from `/switch` during a chat session.
 
 ### File
 | Command              | Description                                               |
