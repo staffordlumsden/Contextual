@@ -440,23 +440,83 @@ def normalize_huggingface_model_entry(raw_value):
     return model_ref, None
 
 
+def clean_ollama_progress_text(value):
+    """Strip terminal control codes from streamed Ollama CLI progress."""
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value or "")
+    return value.replace("\r", "").strip()
+
+
+def extract_progress_percent(value):
+    matches = re.findall(r"(\d{1,3})\s*%", value or "")
+    for match in reversed(matches):
+        percent = int(match)
+        if 0 <= percent <= 100:
+            return percent
+    return None
+
+
+def render_pull_progress(model_ref, status, percent, recent_lines):
+    progress_text = "Progress: waiting for Ollama..."
+    if percent is not None:
+        progress_text = f"Progress: {percent}%"
+
+    lines = [
+        Rule(title=f"[bold green]{model_ref}[/bold green]", style="white"),
+        Align.center(Spinner("dots", text=Text("Pulling Hugging Face model with Ollama...", style="yellow"))),
+        Text(progress_text, style="bold cyan"),
+    ]
+    if status:
+        lines.append(Text(status, style="white"))
+    if recent_lines:
+        lines.append(Text("\n".join(recent_lines[-5:]), style="grey70"))
+    lines.append(Rule(title=Text("This can take a while on first use", style="bold yellow"), style="white", align="right"))
+    return Group(*lines)
+
+
 def ensure_huggingface_model_available(model_ref):
     """Pull a Hugging Face model through Ollama before using it via the API."""
+    output_lines = []
+    status = "Starting ollama pull..."
+    percent = None
     try:
         with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:
-            live.update(
-                Group(
-                    Rule(title=f"[bold green]{model_ref}[/bold green]", style="white"),
-                    Align.center(Spinner("dots", text=Text("Pulling Hugging Face model with Ollama...", style="yellow"))),
-                    Rule(title=Text("This can take a while on first use", style="bold yellow"), style="white", align="right"),
-                ),
-                refresh=True,
-            )
-            result = subprocess.run(
+            live.update(render_pull_progress(model_ref, status, percent, output_lines), refresh=True)
+            process = subprocess.Popen(
                 ["ollama", "pull", model_ref],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                capture_output=True,
+                bufsize=0,
             )
+            current_line = []
+            while True:
+                char = process.stdout.read(1) if process.stdout else ""
+                if char == "" and process.poll() is not None:
+                    if current_line:
+                        line = clean_ollama_progress_text("".join(current_line))
+                        if line:
+                            status = line
+                            output_lines.append(line)
+                            percent = extract_progress_percent(line) if extract_progress_percent(line) is not None else percent
+                    break
+
+                if char in {"\n", "\r"}:
+                    line = clean_ollama_progress_text("".join(current_line))
+                    current_line = []
+                    if line:
+                        status = line
+                        output_lines.append(line)
+                        line_percent = extract_progress_percent(line)
+                        if line_percent is not None:
+                            percent = line_percent
+                        live.update(render_pull_progress(model_ref, status, percent, output_lines), refresh=True)
+                    continue
+
+                if char:
+                    current_line.append(char)
+
+            returncode = process.wait()
+            live.update(render_pull_progress(model_ref, status, percent, output_lines), refresh=True)
     except FileNotFoundError:
         console.print(Panel("[bold red]Ollama CLI not found. Install Ollama or add it to PATH.[/bold red]"))
         return False
@@ -464,11 +524,11 @@ def ensure_huggingface_model_available(model_ref):
         console.print(Panel(f"[bold red]Could not prepare Hugging Face model: {exc}[/bold red]"))
         return False
 
-    if result.returncode == 0:
+    if returncode == 0:
         console.print(Panel(f"Hugging Face model ready: [bold]{model_ref}[/bold]", title="[green]Model Ready[/green]", expand=False))
         return True
 
-    output = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()
+    output = "\n".join(output_lines).strip()
     if len(output) > 1200:
         output = output[-1200:]
     console.print(Panel(
