@@ -2,6 +2,7 @@
 
 **Version:** v. 4.9 (06 July 2026)
 **Author:** Stafford Lumsden  
+**Project site:** https://staffordlumsden.github.io/Contextual/  
 
 Welcome to **Contextual**, a feature rich CLI for interacting with local and Hugging Face Large Language Models via Ollama v. 30 and above.
 
