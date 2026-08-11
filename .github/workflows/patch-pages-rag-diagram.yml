@@ -1,0 +1,89 @@
+name: Patch Pages RAG diagram
+
+on:
+  push:
+    paths:
+      - '.github/workflows/patch-pages-rag-diagram.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replace wide ASCII diagram with responsive vertical schematic
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('index.html')
+          text = path.read_text(encoding='utf-8')
+
+          old_css = ".pipeline{margin-top:26px;border:1px solid var(--line);background:#030a05;padding:18px;overflow:auto}.pipeline pre{min-width:760px;margin:0;color:#99d7a3;font:12px/1.35 var(--mono)}"
+          new_css = ".pipeline{margin-top:26px;border:1px solid var(--line);background:#030a05;padding:22px 18px;overflow:hidden}.pipeline pre{width:max-content;max-width:100%;margin:0 auto;color:#99d7a3;font:clamp(9px,1.05vw,12px)/1.28 var(--mono);white-space:pre}.pipeline-note{margin:14px auto 0;max-width:680px;text-align:center;color:var(--muted);font-size:11px}.pipeline-note b{color:var(--cyan)}"
+
+          old_diagram = '''SOURCE FILE             CHONKIE                  EMBEDDINGS                  CHROMADB                  ANSWER
+    │                       │                         │                          │                        │
+    ▼                       ▼                         ▼                          ▼                        ▼
+[ PDF / DOCX ] ───────► [ recursive ] ─────────► [ document ] ───────────► [ vector ] ───────┐    [ local LLM ]
+[ TXT / MD   ]          [ chunking  ]             [ vectors  ]              [ store  ]        │         ▲
+[ CSV / XLSX ]          [ + overlap ]                                        ▲              │         │
+                                                                                 │              │         │
+QUESTION ───────────────────────────────────────► [ query embedding ] ────────────┴──► TOP K ──┴─────────┘
+                                                                                      chunks'''
+
+          new_diagram = '''┌─────────────────────┐
+│   SOURCE MATERIAL    │
+│ PDF  DOCX  TXT  MD   │
+│ CSV  XLSX            │
+└──────────┬──────────┘
+           │
+           ▼
+    ┌──────────────┐
+    │   CHONKIE    │
+    │ chunk+overlap│
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐
+    │  DOC EMBED   │
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐      ┌──────────────┐
+    │   CHROMADB   │ ◄────│ QUERY EMBED  │ ◄──── QUESTION
+    │ vector store │      └──────────────┘
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐
+    │ TOP K CHUNKS │
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────┐
+    │  LOCAL LLM   │
+    └──────┬───────┘
+           │
+           ▼
+         ANSWER'''
+
+          if old_css not in text:
+              raise SystemExit('Expected pipeline CSS not found; refusing broad rewrite')
+          if old_diagram not in text:
+              raise SystemExit('Expected RAG diagram not found; refusing broad rewrite')
+
+          text = text.replace(old_css, new_css, 1)
+          text = text.replace(old_diagram, new_diagram, 1)
+          text = text.replace('</pre></div></div></section>', '</pre><div class="pipeline-note"><b>INDEX PATH ↓</b> documents are chunked and stored once &nbsp; // &nbsp; <b>QUERY PATH ←</b> each question enters through its own embedding</div></div></div></section>', 1)
+          text = text.replace('@media(max-width:620px){.wrap{', '@media(max-width:620px){.pipeline{overflow-x:auto}.pipeline pre{min-width:520px;font-size:8px}.wrap{', 1)
+          path.write_text(text, encoding='utf-8')
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "Fix responsive RAG ASCII diagram"
+          git push
