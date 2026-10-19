@@ -17,3 +17,6 @@ venv/
 .DS_Store
 *.log
 *.tmp
+
+# Local agent learning logs
+.learnings/

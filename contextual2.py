@@ -40,6 +40,7 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.application import get_app  
 import threading  
 import queue
+from dataclasses import dataclass
 
 try:
     from chonkie import RecursiveChunker
@@ -73,7 +74,7 @@ def embedding_input(model: str, text: str, purpose: str) -> str:
             return f"task: query embedding | query: {text}"
     return text
     
-VALID_OLLAMA_PARAMETERS = {  
+VALID_GENERATION_PARAMETERS = {
     "seed": int,  
     "num_predict": int,  
     "top_k": int,  
@@ -87,7 +88,7 @@ VALID_OLLAMA_PARAMETERS = {
     "stop": list,  
 }  
   
-OLLAMA_PARAMETER_PRESETS = {  
+GENERATION_PARAMETER_PRESETS = {
     "cold": {  
         "temperature": 0.35,  
         "top_p": 0.85,  
@@ -107,6 +108,270 @@ OLLAMA_PARAMETER_PRESETS = {
         "repeat_penalty": 1.05,  
     },  
 }  
+
+PARAMETER_DESCRIPTIONS = {
+    "seed": "Random number seed",
+    "num_predict": "Maximum number of tokens to generate",
+    "top_k": "Sample from the top k tokens",
+    "top_p": "Cumulative probability sampling threshold",
+    "min_p": "Minimum probability relative to the most likely token",
+    "num_ctx": "Context-window size",
+    "temperature": "Sampling temperature",
+    "repeat_penalty": "Repetition penalty",
+    "repeat_last_n": "Number of recent tokens considered for repetition penalties",
+    "num_gpu": "Number of layers assigned to the GPU",
+    "stop": "Stop sequence",
+}
+
+BACKEND_PARAMETER_SUPPORT = {
+    "ollama": frozenset(VALID_GENERATION_PARAMETERS),
+    "litert": frozenset({"seed", "num_predict", "top_k", "top_p", "temperature"}),
+}
+
+
+@dataclass(frozen=True)
+class ChatModel:
+    """A model together with the local service that generates its responses."""
+
+    backend: str
+    model: str
+
+    @property
+    def backend_label(self):
+        return "LiteRT-LM" if self.backend == "litert" else "Ollama"
+
+    def __str__(self):
+        return self.model
+
+
+def litert_base_url():
+    """Return the configured LiteRT-LM OpenAI-compatible API base URL."""
+    return os.environ.get(LITERT_BASE_URL_ENV, DEFAULT_LITERT_BASE_URL).rstrip("/")
+
+
+def _http_error_message(exc):
+    """Extract a useful message from a local model server HTTP error."""
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        body = ""
+    if body:
+        try:
+            parsed = json.loads(body)
+            return parsed.get("error") or parsed.get("message") or body
+        except json.JSONDecodeError:
+            return body
+    return str(exc)
+
+
+def list_litert_models():
+    """List models currently advertised by the LiteRT-LM server."""
+    request = urllib.request.Request(f"{litert_base_url()}/models")
+    with urllib.request.urlopen(request, timeout=LITERT_DISCOVERY_TIMEOUT_SECONDS) as response:
+        payload = json.load(response)
+    return [item["id"] for item in payload.get("data", []) if item.get("id")]
+
+
+def supported_parameters(chat_model):
+    """Return Contextual parameter names supported by the selected backend."""
+    return BACKEND_PARAMETER_SUPPORT.get(chat_model.backend, frozenset())
+
+
+def effective_parameters(chat_model, generation_parameters):
+    """Return only parameters supported by the selected backend."""
+    supported = supported_parameters(chat_model)
+    return {name: value for name, value in generation_parameters.items() if name in supported}
+
+
+def inactive_parameter_names(chat_model, generation_parameters):
+    """Return stored parameters that the selected backend will not receive."""
+    supported = supported_parameters(chat_model)
+    return sorted(name for name in generation_parameters if name not in supported)
+
+
+def _truncate_message_content(content, limit):
+    """Keep the instruction-bearing start and the latest part of an oversized message."""
+    if len(content) <= limit:
+        return content
+    marker = "\n\n[Earlier content omitted to fit the LiteRT-LM context window]\n\n"
+    if limit <= len(marker) + 40:
+        return content[-limit:]
+    head_size = min(1200, max(200, limit // 4))
+    tail_size = limit - head_size - len(marker)
+    return content[:head_size] + marker + content[-tail_size:]
+
+
+def prepare_litert_messages(messages, generation_parameters):
+    """Bound history for LiteRT-LM while preserving system instructions and the latest turn."""
+    output_tokens = generation_parameters.get("num_predict", 2048)
+    input_tokens = max(512, LITERT_CONTEXT_WINDOW_TOKENS - int(output_tokens) - 256)
+    character_budget = input_tokens * 4
+
+    system_messages = [dict(message) for message in messages if message.get("role") == "system"]
+    conversation = [dict(message) for message in messages if message.get("role") != "system"]
+    prepared_system = []
+    remaining = character_budget
+
+    for message in system_messages:
+        if remaining <= 0:
+            break
+        content = str(message.get("content", ""))
+        limit = min(len(content), max(512, character_budget // 4), remaining)
+        message["content"] = _truncate_message_content(content, limit)
+        prepared_system.append(message)
+        remaining -= len(message["content"])
+
+    selected = []
+    for message in reversed(conversation):
+        content = str(message.get("content", ""))
+        if len(content) <= remaining:
+            selected.append(message)
+            remaining -= len(content)
+            continue
+        if not selected and remaining > 0:
+            message["content"] = _truncate_message_content(content, remaining)
+            selected.append(message)
+        break
+
+    selected.reverse()
+    while selected and selected[0].get("role") == "assistant":
+        selected.pop(0)
+
+    prepared = prepared_system + selected
+    if len(prepared) < len(messages) or any(
+        prepared_message.get("content") != original.get("content")
+        for prepared_message, original in zip(prepared, messages)
+    ):
+        console.print(Panel(
+            "Older conversation content was trimmed to fit LiteRT-LM's context window.",
+            title="[yellow]Context Window[/yellow]",
+            border_style="yellow",
+            expand=False,
+        ))
+    return prepared
+
+
+def litert_request_body(chat_model, messages, generation_parameters, thinking_enabled, stream):
+    """Translate Contextual generation settings to LiteRT-LM's chat API."""
+    settings = effective_parameters(chat_model, generation_parameters)
+    body = {
+        "model": chat_model.model,
+        "messages": prepare_litert_messages(messages, settings),
+        "stream": stream,
+        "reasoning_effort": "high" if thinking_enabled else "none",
+    }
+    for name in ("seed", "top_k", "top_p", "temperature"):
+        if name in settings:
+            body[name] = settings[name]
+    if "num_predict" in settings:
+        body["max_completion_tokens"] = settings["num_predict"]
+    if stream:
+        body["stream_options"] = {"include_usage": True}
+    return body
+
+
+def litert_chat_stream(chat_model, messages, generation_parameters, thinking_enabled):
+    """Yield LiteRT-LM chat events in the shape used by Contextual's UI."""
+    body = litert_request_body(chat_model, messages, generation_parameters, thinking_enabled, stream=True)
+    request = urllib.request.Request(
+        f"{litert_base_url()}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+    usage = {}
+    content_emitted = False
+    try:
+        with urllib.request.urlopen(request, timeout=LITERT_INFERENCE_TIMEOUT_SECONDS) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                event = json.loads(data)
+                if event.get("error"):
+                    raise RuntimeError(str(event["error"]))
+                if event.get("usage"):
+                    usage = event["usage"]
+                for choice in event.get("choices", []):
+                    content = choice.get("delta", {}).get("content", "") or ""
+                    if content:
+                        content_emitted = True
+                        yield {"message": {"content": content, "thinking": ""}, "done": False}
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"LiteRT-LM request failed: {_http_error_message(exc)}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot reach LiteRT-LM at {litert_base_url()}: {exc.reason}") from exc
+
+    reasoning_tokens = usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0)
+    if thinking_enabled and not content_emitted and reasoning_tokens:
+        raise RuntimeError(
+            "LiteRT-LM used the available output tokens for reasoning without producing a final answer. "
+            "Increase num_predict or use /set nothink."
+        )
+
+    yield {
+        "message": {"content": "", "thinking": ""},
+        "done": True,
+        "prompt_eval_count": usage.get("prompt_tokens", 0),
+        "eval_count": usage.get("completion_tokens", 0),
+        "reasoning_tokens": reasoning_tokens,
+    }
+
+
+def stream_chat(chat_model, messages, generation_parameters, thinking_enabled=False):
+    """Stream chat through the backend selected with the model."""
+    if chat_model.backend == "litert":
+        return litert_chat_stream(chat_model, messages, generation_parameters, thinking_enabled)
+    return ollama.chat(
+        model=chat_model.model,
+        messages=messages,
+        options=effective_parameters(chat_model, generation_parameters),
+        stream=True,
+        think=thinking_enabled,
+        keep_alive=MODEL_KEEP_ALIVE,
+    )
+
+
+def chat_once(chat_model, messages, generation_parameters, thinking_enabled=False):
+    """Generate one non-streaming response through the selected backend."""
+    if chat_model.backend == "ollama":
+        return ollama.chat(
+            model=chat_model.model,
+            messages=messages,
+            options=effective_parameters(chat_model, generation_parameters),
+            think=thinking_enabled,
+            keep_alive=MODEL_KEEP_ALIVE,
+        )
+
+    body = litert_request_body(chat_model, messages, generation_parameters, thinking_enabled, stream=False)
+    request = urllib.request.Request(
+        f"{litert_base_url()}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=LITERT_INFERENCE_TIMEOUT_SECONDS) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"LiteRT-LM request failed: {_http_error_message(exc)}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot reach LiteRT-LM at {litert_base_url()}: {exc.reason}") from exc
+
+    content = payload.get("choices", [{}])[0].get("message", {}).get("content") or ""
+    usage = payload.get("usage", {})
+    reasoning_tokens = usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0)
+    if thinking_enabled and not content and reasoning_tokens:
+        raise RuntimeError(
+            "LiteRT-LM used the available output tokens for reasoning without producing a final answer. "
+            "Increase num_predict or use /set nothink."
+        )
+    return {
+        "message": {"role": "assistant", "content": content},
+        "prompt_eval_count": usage.get("prompt_tokens", 0),
+        "eval_count": usage.get("completion_tokens", 0),
+    }
   
 # Create the prompt session lazily so non-interactive commands stay quiet.
 session = None
@@ -151,6 +416,11 @@ STREAM_RENDER_INTERVAL_SECONDS = 0.25
 MODEL_KEEP_ALIVE = "30m"
 PRELOAD_CHAT_MODEL_ENV = "CONTEXTUAL_PRELOAD_CHAT_MODEL"
 HF_MODEL_PREFIX = "hf.co/"
+LITERT_BASE_URL_ENV = "CONTEXTUAL_LITERT_BASE_URL"
+DEFAULT_LITERT_BASE_URL = "http://127.0.0.1:9379/v1"
+LITERT_DISCOVERY_TIMEOUT_SECONDS = 2
+LITERT_INFERENCE_TIMEOUT_SECONDS = 600
+LITERT_CONTEXT_WINDOW_TOKENS = int(os.environ.get("CONTEXTUAL_LITERT_CONTEXT_TOKENS", "8192"))
   
   
 def resolve_figlet_font(font_name):
@@ -195,14 +465,14 @@ def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
             console.print(Align.center(f"[{color}]{line}[/{color}]"))  
       
     console.print()  
-    console.print(Align.center(Text("©2026 Stafford Lumsden v. 4.9 (06 July 2026)", style="white")), highlight=False)
+    console.print(Align.center(Text("©2026 Stafford Lumsden v. 5.0 (19 October 2026)", style="white")), highlight=False)
     console.print("\n\n")  
-    console.print(Panel(Align.center("Welcome to Contextual, a feature rich CLI for interacting with local and Hugging Face models via Ollama v. 30 and above. Hugging Face model entry, image generation, speed optimisation, and Windows support added July 2026."), style="bold white", border_style="white"))
+    console.print(Panel(Align.center("Welcome to Contextual, a feature rich CLI for local chat and RAG through Ollama and LiteRT-LM, with Ollama-compatible Hugging Face model import and local image generation."), style="bold white", border_style="white"))
   
-def print_help():  
+def print_help(chat_model=None):
     """Prints a responsive, color-coded help message with available commands."""  
     table = Table.grid(expand=True, padding=(0, 2))  
-    table.add_column(width=20)  # Command column  
+    table.add_column(width=34)  # Command column
     table.add_column()          # Description column  
   
     # Helper to add a section  
@@ -226,7 +496,7 @@ def print_help():
         ("/prompt", "Set a custom system prompt for the session"),  
         ("/set think", "Enable thinking mode for supported models"),  
         ("/set nothink", "Disable thinking mode"),  
-        ("/set verbose", "Toggle Ollama response analytics"),  
+        ("/set verbose", "Toggle response analytics"),
     ])  
   
     # File Section  
@@ -246,18 +516,13 @@ def print_help():
   
     # Decoding & Runtime Section  
     table.add_row(Text("Decoding & Runtime", style="bold yellow"), "")  
-    table.add_row(Text("/set parameter <name> <value>", style="white"), Text("Set a specific Ollama runtime parameter", style="white"))  
-    table.add_row(Text("  seed <int>", style="white"), Text("Random number seed", style="white"))  
-    table.add_row(Text("  num_predict <int>", style="white"), Text("Max number of tokens to predict", style="white"))  
-    table.add_row(Text("  top_k <int>", style="white"), Text("Pick from top k num of tokens", style="white"))  
-    table.add_row(Text("  top_p <float>", style="white"), Text("Pick token based on sum of probabilities", style="white"))  
-    table.add_row(Text("  min_p <float>", style="white"), Text("Pick token based on top token probability * min_p", style="white"))  
-    table.add_row(Text("  num_ctx <int>", style="white"), Text("Set the context size", style="white"))  
-    table.add_row(Text("  temperature <float>", style="white"), Text("Set creativity level", style="white"))  
-    table.add_row(Text("  repeat_penalty <float>", style="white"), Text("How strongly to penalize repetitions", style="white"))  
-    table.add_row(Text("  repeat_last_n <int>", style="white"), Text("Set how far back to look for repetitions", style="white"))  
-    table.add_row(Text("  num_gpu <int>", style="white"), Text("The number of layers to send to the GPU", style="white"))  
-    table.add_row(Text("  stop <string>", style="white"), Text("Set the stop parameter", style="white"))  
+    backend_name = chat_model.backend_label if chat_model else "selected backend"
+    table.add_row(Text("/set parameter <name> <value>", style="white"), Text(f"Set a parameter supported by {backend_name}", style="white"))
+    parameter_names = supported_parameters(chat_model) if chat_model else VALID_GENERATION_PARAMETERS
+    for name in VALID_GENERATION_PARAMETERS:
+        if name in parameter_names:
+            type_name = "string" if VALID_GENERATION_PARAMETERS[name] == list else VALID_GENERATION_PARAMETERS[name].__name__
+            table.add_row(Text(f"  {name} <{type_name}>", style="white"), Text(PARAMETER_DESCRIPTIONS[name], style="white"))
     table.add_row() # Spacer  
   
     # Presets Section  
@@ -280,7 +545,7 @@ def print_help():
   
     console.print(Panel(table, title="[bold]Help Menu[/bold]", border_style="white", expand=True))  
   
-def print_stats(start_time, model, file_name, turns, input_tokens, output_tokens, ollama_parameters, is_document_chat):  
+def print_stats(start_time, model, file_name, turns, input_tokens, output_tokens, generation_parameters, is_document_chat):
     """Prints the session statistics and model parameters side-by-side."""  
     session_time = time.time() - start_time  
     mode = "Document Chat" if is_document_chat else "General Chat"  
@@ -290,15 +555,20 @@ def print_stats(start_time, model, file_name, turns, input_tokens, output_tokens
     Session Time: {session_time:.2f} seconds  
     Mode: {mode}  
     Model: {model}  
+    Backend: {model.backend_label}
     File: {file_name if file_name else 'N/A'}  
     Turns: {turns}  
     Input Tokens: {input_tokens}  
     Output Tokens: {output_tokens}  
     """  
       
-    params_text = "\n".join([f"{key}: {value}" for key, value in ollama_parameters.items()])  
+    active_parameters = effective_parameters(model, generation_parameters)
+    params_text = "\n".join([f"{key}: {value}" for key, value in active_parameters.items()])
     if not params_text:  
         params_text = "No parameters set."  
+    inactive = inactive_parameter_names(model, generation_parameters)
+    if inactive:
+        params_text += f"\n\nInactive for {model.backend_label}: {', '.join(inactive)}"
   
     stats_panel = Panel(stats_text, title="[bold green]Session Statistics[/bold green]", border_style="white", style="white")  
     params_panel = Panel(params_text, title="[bold yellow]Model Parameters[/bold yellow]", border_style="yellow", style="yellow")  
@@ -568,51 +838,85 @@ def select_huggingface_chat_model():
         if model_ref:
             if ensure_huggingface_model_available(model_ref):
                 console.print(Panel(f"Using Hugging Face model: [bold]{model_ref}[/bold]", title="[green]Model Selected[/green]", expand=False))
-                return model_ref
+                return ChatModel("ollama", model_ref)
             continue
 
         console.print(Panel(f"[bold red]{error}[/bold red]"))
 
 
 def select_chat_model(is_interactive):  
-    """Lists available chat models and prompts the user to select one."""  
-    try:  
+    """List chat models by serving backend and return the selected model."""
+    ollama_models = []
+    litert_models = []
+    ollama_error = None
+    litert_error = None
+
+    try:
         models_info = ollama.list()  
-        available_models = [model['model'] for model in models_info['models'] if 'embed' not in model['model']]  
-        if not available_models and not is_interactive:
-            console.print(Panel("[bold red]No chat models found. Please install one (e.g., 'ollama pull llama2').[/bold red]"))  
-            return None  
-  
-        if is_interactive:  
-            if available_models:
-                model_list = "\n".join(f"[yellow]{i + 1}[/yellow]: {model_name}" for i, model_name in enumerate(available_models))
-                model_list += "\n[yellow]h[/yellow]: Enter a Hugging Face model (hf.co/{username}/{repository}:{quantization})"
-            else:
-                model_list = "[yellow]h[/yellow]: Enter a Hugging Face model (hf.co/{username}/{repository}:{quantization})"
-            console.print(Panel(model_list, title="[bold green]Select a Chat Model[/bold green]", expand=True))  
-            while True:
-                choice = Prompt.ask("Select a model number or h", default="1" if available_models else "h").strip().lower()
-                if choice == "h":
-                    return select_huggingface_chat_model()
-                if choice.isdigit():
-                    index = int(choice)
-                    if 1 <= index <= len(available_models):
-                        return available_models[index - 1]
-                console.print(Panel("[bold red]Invalid selection. Enter a listed number or h.[/bold red]"))
-        else:  
-            return available_models[0]  
-  
-    except Exception as e:  
-        console.print(Panel(f"[bold red]Error fetching chat models: {e}[/bold red]"))  
-        return None  
+        ollama_models = [model['model'] for model in models_info['models'] if 'embed' not in model['model']]
+    except Exception as exc:
+        ollama_error = str(exc)
+
+    try:
+        litert_models = list_litert_models()
+    except Exception as exc:
+        litert_error = str(exc)
+
+    choices = [ChatModel("ollama", name) for name in ollama_models]
+    choices.extend(ChatModel("litert", name) for name in litert_models)
+
+    if not is_interactive:
+        if choices:
+            return choices[0]
+        console.print(Panel("[bold red]No chat models are available from Ollama or LiteRT-LM.[/bold red]"))
+        return None
+
+    model_lines = ["[bold cyan]Ollama served models[/bold cyan]"]
+    if ollama_models:
+        model_lines.extend(
+            f"[yellow]{index + 1}[/yellow]: {model.model}"
+            for index, model in enumerate(choices[:len(ollama_models)])
+        )
+    else:
+        status = f"Unavailable: {ollama_error}" if ollama_error else "No chat models found"
+        model_lines.append(f"[dim]{status}[/dim]")
+
+    model_lines.extend(["", "[bold magenta]LiteRT-LM served models[/bold magenta]"])
+    if litert_models:
+        start_index = len(ollama_models)
+        model_lines.extend(
+            f"[yellow]{index + 1}[/yellow]: {model.model}"
+            for index, model in enumerate(choices[start_index:], start=start_index)
+        )
+    else:
+        status = f"Unavailable at {litert_base_url()}: {litert_error}" if litert_error else "No chat models found"
+        model_lines.append(f"[dim]{status}[/dim]")
+
+    model_lines.extend([
+        "",
+        "[bold green]Additional model[/bold green]",
+        "[yellow]h[/yellow]: Pull a Hugging Face model into Ollama",
+    ])
+    console.print(Panel("\n".join(model_lines), title="[bold green]Select a Chat Model[/bold green]", expand=True))
+
+    default_choice = "1" if choices else "h"
+    while True:
+        choice = Prompt.ask("Select a model number or h", default=default_choice).strip().lower()
+        if choice == "h":
+            return select_huggingface_chat_model()
+        if choice.isdigit():
+            index = int(choice)
+            if 1 <= index <= len(choices):
+                return choices[index - 1]
+        console.print(Panel("[bold red]Invalid selection. Enter a listed number or h.[/bold red]"))
 
 def should_preload_chat_model():
     """Return whether interactive chat should warm the model before the first prompt."""
     value = os.environ.get(PRELOAD_CHAT_MODEL_ENV, "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
-def warm_chat_model(model_name):
-    """Load the selected chat model into Ollama so the first real prompt starts warm."""
+def warm_chat_model(chat_model):
+    """Load the selected chat model before the first real prompt."""
     if not should_preload_chat_model():
         return
 
@@ -621,19 +925,27 @@ def warm_chat_model(model_name):
         with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:
             live.update(
                 Group(
-                    Rule(title=f"[bold green]{model_name}[/bold green]", style="white"),
+                    Rule(title=f"[bold green]{chat_model}[/bold green]", style="white"),
                     Align.center(Spinner("dots", text=Text("Warming model...", style="yellow"))),
                     Rule(title=Text("Preparing first response", style="bold yellow"), style="white", align="right"),
                 ),
                 refresh=True,
             )
-            ollama.generate(
-                model=model_name,
-                prompt="",
-                options={"num_predict": 0},
-                stream=False,
-                keep_alive=MODEL_KEEP_ALIVE,
-            )
+            if chat_model.backend == "ollama":
+                ollama.generate(
+                    model=chat_model.model,
+                    prompt="",
+                    options={"num_predict": 0},
+                    stream=False,
+                    keep_alive=MODEL_KEEP_ALIVE,
+                )
+            else:
+                chat_once(
+                    chat_model,
+                    [{"role": "user", "content": "Reply with OK."}],
+                    {"num_predict": 2, "temperature": 0.0},
+                    thinking_enabled=False,
+                )
         console.print(Panel(f"Model warmed in {time.time() - start:.2f}s.", title="[bold green]Ready[/bold green]", border_style="green", expand=False))
     except Exception as e:
         console.print(Panel(f"[bold yellow]Model warm-up skipped: {e}[/bold yellow]", title="[yellow]Warm-up Warning[/yellow]", expand=False))
@@ -1263,7 +1575,7 @@ def handle_image_generation():
         except Exception as e:  
             console.print(Panel(f"[bold red]Image generation failed: {e}[/bold red]"))  
   
-def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **kwargs):  
+def handle_chat_interaction(chat_model, is_document_chat, generation_parameters, **kwargs):
     """Handles the main chat loop for both document and general chat modes."""  
     messages = []  
     turns = 0  
@@ -1339,10 +1651,17 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                         "seed": 42,  
                         "stop": ["<<END>>"],  
                     }  
-                    ollama_parameters.update(csv_cleaning_params)  
+                    applied_params = {
+                        name: value for name, value in csv_cleaning_params.items()
+                        if name in supported_parameters(chat_model)
+                    }
+                    generation_parameters.update(applied_params)
   
                     # Display confirmation panel  
-                    params_text = "\n".join([f"{key}: {value}" for key, value in csv_cleaning_params.items()])  
+                    params_text = "\n".join([f"{key}: {value}" for key, value in applied_params.items()])
+                    skipped_params = sorted(set(csv_cleaning_params) - set(applied_params))
+                    if skipped_params:
+                        params_text += f"\n\nNot supported by {chat_model.backend_label}: {', '.join(skipped_params)}"
                     console.print(Panel(params_text, title="[bold yellow]Default Parameters for Cleaned CSV Applied[/bold yellow]", border_style="yellow", style="yellow"))  
                       
                     console.print(Panel("Now, please select an embedding model.", title="[bold green]Switching to Document Chat[/bold green]"))  
@@ -1384,22 +1703,27 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                 command = parts[1].lower()  
                 if command == 'think':  
                     thinking_enabled = True  
-                    console.print(Panel("Thinking mode [bold green]enabled[/bold green]. Ollama will receive [bold]think=true[/bold] for supported models.", title="[yellow]Mode Changed[/yellow]"))  
+                    console.print(Panel(f"Thinking mode [bold green]enabled[/bold green] for {chat_model.backend_label}.", title="[yellow]Mode Changed[/yellow]"))
                     continue  
                 elif command == 'nothink':  
                     thinking_enabled = False  
-                    console.print(Panel("Thinking mode [bold red]disabled[/bold red]. Ollama will receive [bold]think=false[/bold] for supported models.", title="[yellow]Mode Changed[/yellow]"))  
+                    console.print(Panel(f"Thinking mode [bold red]disabled[/bold red] for {chat_model.backend_label}.", title="[yellow]Mode Changed[/yellow]"))
                     continue  
                 elif command == 'verbose':  
                     verbose_enabled = not verbose_enabled  
                     state = "[bold green]enabled[/bold green]" if verbose_enabled else "[bold red]disabled[/bold red]"  
-                    console.print(Panel(f"Ollama response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))  
+                    console.print(Panel(f"Response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))
                     continue  
   
                 preset_name = parts[1]  
-                if preset_name in OLLAMA_PARAMETER_PRESETS:  
-                    ollama_parameters.update(OLLAMA_PARAMETER_PRESETS[preset_name])  
-                    params_text = "\n".join([f"{key}: {value}" for key, value in OLLAMA_PARAMETER_PRESETS[preset_name].items()])  
+                if preset_name in GENERATION_PARAMETER_PRESETS:
+                    preset = GENERATION_PARAMETER_PRESETS[preset_name]
+                    applied = {name: value for name, value in preset.items() if name in supported_parameters(chat_model)}
+                    generation_parameters.update(applied)
+                    params_text = "\n".join([f"{key}: {value}" for key, value in applied.items()])
+                    skipped = sorted(set(preset) - set(applied))
+                    if skipped:
+                        params_text += f"\n\nNot supported by {chat_model.backend_label}: {', '.join(skipped)}"
                     console.print(Panel(params_text, title=f"[bold yellow]'{preset_name.capitalize()}' Preset Applied[/bold yellow]", border_style="yellow", style="yellow"))  
                 else:  
                     console.print(Panel(f"[bold red]Invalid preset or command: {preset_name}[/bold red]"))  
@@ -1413,19 +1737,34 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                     console.print(Panel("[bold red]Invalid verbose value. Use /set verbose, /set verbose on, or /set verbose off.[/bold red]"))
                     continue
                 state = "[bold green]enabled[/bold green]" if verbose_enabled else "[bold red]disabled[/bold red]"
-                console.print(Panel(f"Ollama response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))
+                console.print(Panel(f"Response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))
             elif len(parts) >= 4 and parts[1] == "parameter":  
-                _, _, param_name, param_value = parts  
-                if param_name in VALID_OLLAMA_PARAMETERS:  
+                param_name = parts[2]
+                param_value = " ".join(parts[3:])
+                if param_name in VALID_GENERATION_PARAMETERS:
+                    if param_name not in supported_parameters(chat_model):
+                        console.print(Panel(
+                            f"[bold red]Parameter {param_name} is not supported by {chat_model.backend_label}.[/bold red]\n"
+                            f"Use /help to see parameters available for the selected backend."
+                        ))
+                        continue
                     try:  
-                        param_type = VALID_OLLAMA_PARAMETERS[param_name]  
+                        param_type = VALID_GENERATION_PARAMETERS[param_name]
+                        if chat_model.backend == "litert" and param_name == "num_predict":
+                            requested_tokens = int(param_value)
+                            if requested_tokens > LITERT_CONTEXT_WINDOW_TOKENS - 512:
+                                console.print(Panel(
+                                    f"[bold red]num_predict must be at most {LITERT_CONTEXT_WINDOW_TOKENS - 512} "
+                                    f"for the configured LiteRT-LM context window.[/bold red]"
+                                ))
+                                continue
                         if param_type == list:  
-                            ollama_parameters[param_name] = [param_value]  
+                            generation_parameters[param_name] = [param_value]
                         else:  
-                            ollama_parameters[param_name] = param_type(param_value)  
-                        console.print(Panel(f"Parameter [bold]{param_name}[/bold] set to [bold]{ollama_parameters[param_name]}[/bold].", style="bold yellow"))  
+                            generation_parameters[param_name] = param_type(param_value)
+                        console.print(Panel(f"Parameter [bold]{param_name}[/bold] set to [bold]{generation_parameters[param_name]}[/bold] for {chat_model.backend_label}.", style="bold yellow"))
                     except ValueError:  
-                        console.print(Panel(f"[bold red]Invalid value type for {param_name}. Expected {VALID_OLLAMA_PARAMETERS[param_name].__name__}.[/bold red]"))  
+                        console.print(Panel(f"[bold red]Invalid value type for {param_name}. Expected {VALID_GENERATION_PARAMETERS[param_name].__name__}.[/bold red]"))
                 else:  
                     console.print(Panel(f"[bold red]Invalid parameter: {param_name}[/bold red]"))  
             else:  
@@ -1442,14 +1781,18 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
             if new_model:  
                 chat_model = new_model  
                 warm_chat_model(chat_model)
-                console.print(Panel(f"Switched to model: [bold]{chat_model}[/bold]", title="[green]Model Switched[/green]", expand=False))  
+                message = f"Switched to [bold]{chat_model}[/bold] via {chat_model.backend_label}."
+                inactive = inactive_parameter_names(chat_model, generation_parameters)
+                if inactive:
+                    message += f"\n\nStored settings inactive for this backend: {', '.join(inactive)}"
+                console.print(Panel(message, title="[green]Model Switched[/green]", expand=False))
             continue  
         if user_message.lower().strip() == '/help':  
-            print_help()  
+            print_help(chat_model)
             continue  
         if user_message.lower().strip() == '/stats':  
             file_name = os.path.basename(file_path) if current_mode_is_doc_chat and file_path else 'N/A'  
-            print_stats(start_time, chat_model, file_name, turns, input_tokens, output_tokens, ollama_parameters, current_mode_is_doc_chat)  
+            print_stats(start_time, chat_model, file_name, turns, input_tokens, output_tokens, generation_parameters, current_mode_is_doc_chat)
             continue  
   
         turns += 1  
@@ -1495,7 +1838,7 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                 messages.append({'role': 'user', 'content': prompt})  
                   
                 system_prompt_parts = []  
-                if thinking_enabled:  
+                if thinking_enabled and chat_model.backend == "ollama":
                     system_prompt_parts.append("Think step-by-step...")  
                 if user_system_prompt:  
                     system_prompt_parts.append(user_system_prompt)  
@@ -1515,14 +1858,12 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                     refresh=True,  
                 )  
   
-                response_stream = ollama.chat(
-                    model=chat_model,
-                    messages=final_messages,
-                    options=ollama_parameters,
-                    stream=True,
-                    think=thinking_enabled,
-                    keep_alive=MODEL_KEEP_ALIVE,
-                )  
+                response_stream = stream_chat(
+                    chat_model,
+                    final_messages,
+                    generation_parameters,
+                    thinking_enabled=thinking_enabled,
+                )
                   
                 full_response_content = ""  
                 api_thinking_text = ""
@@ -1606,6 +1947,7 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                 if verbose_enabled and full_response_data:
                     prompt_eval_count = full_response_data.get('prompt_eval_count')
                     eval_count = full_response_data.get('eval_count')
+                    reasoning_tokens = full_response_data.get('reasoning_tokens')
                     prompt_eval_duration = full_response_data.get('prompt_eval_duration')
                     eval_duration = full_response_data.get('eval_duration')
                     total_duration = full_response_data.get('total_duration')
@@ -1618,6 +1960,8 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                         metrics.append(f"Input tokens evaluated: {prompt_eval_count}")
                     if eval_count is not None:
                         metrics.append(f"Output tokens: {eval_count}")
+                    if reasoning_tokens:
+                        metrics.append(f"Reasoning tokens: {reasoning_tokens}")
                     if prompt_eval_duration:
                         prompt_eval_seconds = prompt_eval_duration / 1_000_000_000
                         metrics.append(f"Prompt eval: {prompt_eval_seconds:.2f}s")
@@ -1629,9 +1973,9 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
                         if eval_count is not None and eval_seconds > 0:
                             metrics.append(f"Output rate: {eval_count / eval_seconds:.2f} tokens/s")
                     if total_duration:
-                        metrics.append(f"Ollama total: {total_duration / 1_000_000_000:.2f}s")
+                        metrics.append(f"Backend total: {total_duration / 1_000_000_000:.2f}s")
                     if metrics:
-                        metrics_panel = Panel("\n".join(metrics), title="[bold yellow]Ollama Metrics[/bold yellow]", border_style="yellow", expand=False)
+                        metrics_panel = Panel("\n".join(metrics), title=f"[bold yellow]{chat_model.backend_label} Metrics[/bold yellow]", border_style="yellow", expand=False)
             if metrics_panel:
                 console.print(metrics_panel)
   
@@ -1640,7 +1984,7 @@ def handle_chat_interaction(chat_model, is_document_chat, ollama_parameters, **k
             if messages and messages[-1]['role'] == 'user':  
                 messages.pop()  
         except Exception as e:  
-            console.print(Panel(f"[bold red]An error occurred with Ollama: {e}[/bold red]"))  
+            console.print(Panel(f"[bold red]An error occurred with {chat_model.backend_label}: {e}[/bold red]"))
   
   
 def clean_csv(input_file):  
@@ -1715,7 +2059,7 @@ def main():
         return
 
     is_interactive = sys.stdout.isatty() and not args.question  
-    ollama_parameters = {}  
+    generation_parameters = {}
   
     while True:  
         print_banner(args.figlet_font)
@@ -1791,7 +2135,7 @@ def main():
                         "seed": 42,  
                         "stop": ["<<END>>"],  
                     }  
-                    ollama_parameters.update(csv_cleaning_params)  
+                    generation_parameters.update(csv_cleaning_params)
   
                     # Display confirmation panel  
                     params_text = "\n".join([f"{key}: {value}" for key, value in csv_cleaning_params.items()])  
@@ -1816,6 +2160,15 @@ def main():
                 break  
             if is_interactive:
                 warm_chat_model(chat_model)
+
+            inactive = inactive_parameter_names(chat_model, generation_parameters)
+            if inactive:
+                console.print(Panel(
+                    f"Settings not supported by {chat_model.backend_label} will be inactive: {', '.join(inactive)}",
+                    title="[yellow]Backend Parameters[/yellow]",
+                    border_style="yellow",
+                    expand=False,
+                ))
   
             file_content, file_path, collection = select_and_load_file(args.file_path, embedding_model)  
             if not file_content:  
@@ -1824,7 +2177,7 @@ def main():
                 else:  
                     continue  
   
-            console.print(Panel(f"Using embedding model: [bold]{embedding_model}[/bold] and chat model: [bold]{chat_model}[/bold]", title="[green]Ready[/green]", expand=False))  
+            console.print(Panel(f"Using embedding model: [bold]{embedding_model}[/bold] and chat model: [bold]{chat_model}[/bold] via {chat_model.backend_label}", title="[green]Ready[/green]", expand=False))
   
             if args.question:  
                 # Non-interactive document question  
@@ -1847,14 +2200,14 @@ def main():
                          "Cite the bracketed labels. If the answer is not in the context, say 'Not found in the provided context.'")  
                 prompt = f"{guard}\n\nContext:\n{context}\n\nQuestion: {args.question}\n"  
                   
-                response = ollama.chat(model=chat_model, messages=[{'role': 'user', 'content': prompt}], options=ollama_parameters)  
+                response = chat_once(chat_model, [{'role': 'user', 'content': prompt}], generation_parameters)
                 console.print(Panel(Markdown(response['message']['content']), title=f"[bold green]{chat_model}[/bold green]"))  
                 break  
             else:  
                 should_exit = handle_chat_interaction(  
                     chat_model=chat_model,  
                     is_document_chat=True,  
-                    ollama_parameters=ollama_parameters,  
+                    generation_parameters=generation_parameters,
                     collection=collection,  
                     embedding_model=embedding_model,  
                     file_path=file_path  
@@ -1869,8 +2222,8 @@ def main():
             if is_interactive:
                 warm_chat_model(chat_model)
               
-            console.print(Panel(f"Using model: [bold]{chat_model}[/bold]", title="[green]Ready for General Chat[/green]", expand=False))  
-            should_exit = handle_chat_interaction(chat_model=chat_model, is_document_chat=False, ollama_parameters=ollama_parameters)  
+            console.print(Panel(f"Using model: [bold]{chat_model}[/bold] via {chat_model.backend_label}", title="[green]Ready for General Chat[/green]", expand=False))
+            should_exit = handle_chat_interaction(chat_model=chat_model, is_document_chat=False, generation_parameters=generation_parameters)
             if should_exit:  
                 break  
           

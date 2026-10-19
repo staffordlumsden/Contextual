@@ -1,14 +1,16 @@
 # Contextual
 
-**Version:** v. 4.9 (06 July 2026)
+**Version:** v. 5.0 (19 October 2026)
 **Author:** Stafford Lumsden  
 **Project site:** https://staffordlumsden.github.io/Contextual/  
 
-Welcome to **Contextual**, a feature rich CLI for interacting with local and Hugging Face Large Language Models via Ollama v. 30 and above.
+Welcome to **Contextual**, a feature rich CLI for interacting with local models served by Ollama and LiteRT-LM. Ollama-compatible Hugging Face models can also be imported from the chat-model picker.
+
+> **New in v. 5.0:** The chat-model picker now discovers and groups models served by Ollama and LiteRT-LM. Selecting a model selects its backend automatically. System prompts, thinking controls, presets, parameter commands, streaming and response statistics use the selected backend. Parameters unsupported by that backend are identified rather than silently passed through.
 
 > **New in v. 4.9:** When selecting a chat model, choose **h** to paste an Ollama Hugging Face command such as `ollama run hf.co/{username}/{repository}:{quantization}`. Contextual extracts the `hf.co/...` model reference, normalizes pasted line breaks and quantization tag casing, pulls the model with live Ollama progress, and then uses it for chat.
 
-> **Speed note:** Contextual now warms the selected chat model on startup/model selection and keeps it alive for faster first-token response times. This moves the cold model-load wait before the first user prompt. Disable this behaviour with `CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh`.
+> **Speed note:** Contextual warms the selected chat model on startup and after `/switch`, moving the cold model-load wait before the first user prompt. Disable this behaviour with `CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh`.
 
 > **Windows support note:** Contextual now includes PowerShell setup and runner scripts (`setup_windows.ps1` and `run_chatbot.ps1`). Chat, RAG, CSV, and image generation are intended to run on Windows with Ollama for Windows; image generation opens PowerShell on Windows, Terminal on macOS, and a detected terminal emulator on Linux.
 
@@ -80,8 +82,8 @@ List available fonts with:
 - 📄 **Document Chat**: Load `.txt`, `.md`, `.docx`, `.pdf`, `.csv`, and `.xlsx` files, chunk them, and query with a chosen embedding model.
 - 🔍 **RAG (Retrieval-Augmented Generation)**: [Chonkie](https://github.com/feyninc/chonkie)-backed recursive document chunking, embedding, storage in ChromaDB, and context-aware answers.
 - 🧠 **EmbeddingGemma**: Optimized support for `task: query embedding | query:` and `task: document embedding | text:` prefixes to improve semantic retrieval.
-- 🔥 **Dynamic Model Switching**: Easily swap between chat models, embedding models, and Ollama-compatible Hugging Face chat models.
-- 🧮 **Token Stats and Analytics**: View session stats with `/stats`, and toggle per-response Ollama metrics with `/set verbose`.
+- 🔥 **Backend-aware Model Switching**: Select from grouped Ollama and LiteRT-LM models, or import an Ollama-compatible Hugging Face model.
+- 🧮 **Token Stats and Analytics**: View session stats with `/stats`, and toggle backend response metrics with `/set verbose`.
 - 📝 **Conversation Saving**: Export chats in Markdown or plain text.
 - 🧩 **CSV Cleaning Mode**: Automatically clean and reformat CSVs for model-friendly analysis.
 - 🖼️ **Image Generation**: Opens a platform terminal window to run `ollama run x/flux2-klein:9b` with your prompt and saves images to the selected folder. After generation, return to Contextual and press Enter to import and list the new PNGs.
@@ -119,6 +121,18 @@ List available fonts with:
    ollama run hf.co/{username}/{repository}:{quantization}
    ```
 
+   LiteRT-LM models appear automatically when its OpenAI-compatible server is running. Contextual checks `http://127.0.0.1:9379/v1` by default:
+   ```bash
+   litert-lm serve --host 127.0.0.1 --port 9379
+   ```
+
+   To use another LiteRT-LM endpoint:
+   ```bash
+   CONTEXTUAL_LITERT_BASE_URL=http://127.0.0.1:8080/v1 ./run_chatbot.sh
+   ```
+
+   Contextual budgets LiteRT-LM conversation history against an 8,192-token context window by default. If a served model uses a different limit, set `CONTEXTUAL_LITERT_CONTEXT_TOKENS` to match it.
+
 3. **Run Contextual:**
    ```bash
    python contextual2.py
@@ -143,12 +157,22 @@ List available fonts with:
 | `/prompt`            | Set a custom system prompt for the session               |
 | `/set think`         | Enable thinking mode for supported models                |
 | `/set nothink`       | Disable thinking mode                                    |
-| `/set verbose`       | Toggle per-response Ollama analytics                    |
-| `/set verbose on/off`| Explicitly enable or disable Ollama analytics            |
+| `/set verbose`       | Toggle per-response backend analytics                   |
+| `/set verbose on/off`| Explicitly enable or disable backend analytics           |
+
+### Chat Model Backends
+
+The model picker is divided into:
+
+- **Ollama served models** discovered from the local Ollama service.
+- **LiteRT-LM served models** discovered from its OpenAI-compatible `/v1/models` endpoint.
+- **Additional model**, where **h** imports an Ollama-compatible Hugging Face model into Ollama.
+
+The selected model carries its backend through general chat, document chat and `/switch`. Ollama continues to supply document embeddings even when LiteRT-LM generates the answer.
 
 ### Hugging Face Models
 
-When Contextual asks you to select a chat model, local Ollama models are listed first. Select **h** to enter a Hugging Face model.
+When Contextual asks you to select a chat model, Ollama and LiteRT-LM models are listed in separate groups. Select **h** to enter a Hugging Face model that Ollama will pull and serve.
 
 1. Open an Ollama-compatible model page on Hugging Face.
 2. Copy the Ollama command, for example:
@@ -179,7 +203,7 @@ This option is also available from `/switch` during a chat session.
 ### Decoding & Runtime
 | Command                            | Description                                               |
 |-----------------------------------|-----------------------------------------------------------|
-| `/set parameter <name> <value>`   | Set a specific Ollama runtime parameter                  |
+| `/set parameter <name> <value>`   | Set a parameter supported by the selected backend        |
 | `seed <int>`                      | Random number seed                                       |
 | `num_predict <int>`               | Max number of tokens to predict                          |
 | `top_k <int>`                     | Pick from top k num of tokens                            |
@@ -192,6 +216,8 @@ This option is also available from `/switch` during a chat session.
 | `num_gpu <int>`                   | The number of layers to send to the GPU                  |
 | `stop <string>`                   | Set the stop parameter                                   |
 
+Contextual uses the same commands for both backends and translates them where necessary. LiteRT-LM supports `seed`, `num_predict`, `top_k`, `top_p` and `temperature`; `num_predict` is sent as `max_completion_tokens`. Ollama-specific settings remain available when an Ollama model is selected. `/help` lists only the parameters supported by the current backend.
+
 ### Presets
 | Command              | Description                                               |
 |----------------------|-----------------------------------------------------------|
@@ -201,7 +227,7 @@ This option is also available from `/switch` during a chat session.
 
 ### Speed and Analytics
 
-Contextual warms the selected chat model before the first prompt and after `/switch`, using Ollama keep-alive to reduce cold-start TTFT on the first real response. To skip model preloading:
+Contextual warms the selected chat model before the first prompt and after `/switch`. Ollama uses keep-alive; LiteRT-LM receives a short warm-up request. To skip model preloading:
 
 ```bash
 CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh
@@ -214,14 +240,14 @@ $env:CONTEXTUAL_PRELOAD_CHAT_MODEL="0"
 .\run_chatbot.ps1
 ```
 
-Use `/set verbose` to toggle an Ollama metrics box under each model response. The metrics include:
+Use `/set verbose` to toggle a backend metrics box under each model response. Available metrics include:
 
 - First chunk time
 - TTFT
 - Input and output token counts
 - Prompt eval time and prompt eval rate
 - Generation time and output rate
-- Ollama total time
+- Backend-reported evaluation and total time, when available
 
 ### Image Generation
 | Command              | Description                                               |
