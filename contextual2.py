@@ -279,6 +279,7 @@ def litert_chat_stream(chat_model, messages, generation_parameters, thinking_ena
     )
     usage = {}
     content_emitted = False
+    reserved_token_scan = ""
     try:
         with urllib.request.urlopen(request, timeout=LITERT_INFERENCE_TIMEOUT_SECONDS) as response:
             for raw_line in response:
@@ -296,6 +297,13 @@ def litert_chat_stream(chat_model, messages, generation_parameters, thinking_ena
                 for choice in event.get("choices", []):
                     content = choice.get("delta", {}).get("content", "") or ""
                     if content:
+                        reserved_token_scan = (reserved_token_scan + content)[-256:]
+                        if LITERT_RESERVED_OUTPUT_PATTERN.search(reserved_token_scan):
+                            raise RuntimeError(
+                                "LiteRT-LM emitted reserved Gemma control tokens, which indicates "
+                                "corrupted backend inference. Restart LiteRT-LM; on a Metal GPU, "
+                                "configure activation_data_type as fp32 for this model."
+                            )
                         content_emitted = True
                         yield {"message": {"content": content, "thinking": ""}, "done": False}
     except urllib.error.HTTPError as exc:
@@ -421,6 +429,7 @@ LITERT_DISCOVERY_TIMEOUT_SECONDS = 2
 LITERT_INFERENCE_TIMEOUT_SECONDS = 600
 LITERT_CONTEXT_WINDOW_TOKENS = int(os.environ.get("CONTEXTUAL_LITERT_CONTEXT_TOKENS", "8192"))
 LITERT_DEFAULT_MAX_COMPLETION_TOKENS = int(os.environ.get("CONTEXTUAL_LITERT_MAX_COMPLETION_TOKENS", "1024"))
+LITERT_RESERVED_OUTPUT_PATTERN = re.compile(r"(?:\[multimodal\]|<unused\d+>|<mask>)", re.IGNORECASE)
   
   
 def resolve_figlet_font(font_name):

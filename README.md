@@ -133,6 +133,21 @@ List available fonts with:
 
    Contextual budgets LiteRT-LM conversation history against an 8,192-token context window by default. If a served model uses a different limit, set `CONTEXTUAL_LITERT_CONTEXT_TOKENS` to match it.
 
+   On macOS, Gemma 4 models served through LiteRT-LM's Metal GPU backend should use FP32 activations. LiteRT-LM 0.17.1 can otherwise emit corrupted language or reserved tokens such as `[multimodal]`, `<unused...>` and `<mask>`. Set `activation_data_type` for the model in `~/.litert-lm/config.json`, then restart the LiteRT-LM service:
+
+   ```json
+   {
+     "models": {
+       "gemma4-26b": {
+         "backend": "gpu",
+         "activation_data_type": "fp32"
+       }
+     }
+   }
+   ```
+
+   Contextual detects this reserved-token failure and rejects the response so it is not added to the conversation history.
+
 3. **Run Contextual:**
    ```bash
    python contextual2.py

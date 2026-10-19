@@ -86,6 +86,21 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(chunks[-1]["eval_count"], 2)
 
     @patch("contextual2.urllib.request.urlopen")
+    def test_litert_rejects_reserved_gemma_tokens(self, urlopen):
+        event = {"choices": [{"delta": {"content": "[multimodal]<unused30>"}}]}
+        stream = f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n"
+        urlopen.return_value = io.BytesIO(stream.encode("utf-8"))
+        model = contextual2.ChatModel("litert", "gemma4-26b")
+
+        with self.assertRaisesRegex(RuntimeError, "reserved Gemma control tokens"):
+            list(contextual2.litert_chat_stream(
+                model,
+                [{"role": "user", "content": "Hello"}],
+                {},
+                thinking_enabled=False,
+            ))
+
+    @patch("contextual2.urllib.request.urlopen")
     def test_litert_reports_exhausted_thinking_budget(self, urlopen):
         urlopen.return_value = io.BytesIO(json.dumps({
             "choices": [{"message": {"role": "assistant", "content": None}}],
