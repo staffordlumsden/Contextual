@@ -203,7 +203,7 @@ def _truncate_message_content(content, limit):
 
 def prepare_litert_messages(messages, generation_parameters):
     """Bound history for LiteRT-LM while preserving system instructions and the latest turn."""
-    output_tokens = generation_parameters.get("num_predict", 2048)
+    output_tokens = generation_parameters.get("num_predict", LITERT_DEFAULT_MAX_COMPLETION_TOKENS)
     input_tokens = max(512, LITERT_CONTEXT_WINDOW_TOKENS - int(output_tokens) - 256)
     character_budget = input_tokens * 4
 
@@ -259,12 +259,11 @@ def litert_request_body(chat_model, messages, generation_parameters, thinking_en
         "messages": prepare_litert_messages(messages, settings),
         "stream": stream,
         "reasoning_effort": "high" if thinking_enabled else "none",
+        "max_completion_tokens": settings.get("num_predict", LITERT_DEFAULT_MAX_COMPLETION_TOKENS),
     }
     for name in ("seed", "top_k", "top_p", "temperature"):
         if name in settings:
             body[name] = settings[name]
-    if "num_predict" in settings:
-        body["max_completion_tokens"] = settings["num_predict"]
     if stream:
         body["stream_options"] = {"include_usage": True}
     return body
@@ -421,6 +420,7 @@ DEFAULT_LITERT_BASE_URL = "http://127.0.0.1:9379/v1"
 LITERT_DISCOVERY_TIMEOUT_SECONDS = 2
 LITERT_INFERENCE_TIMEOUT_SECONDS = 600
 LITERT_CONTEXT_WINDOW_TOKENS = int(os.environ.get("CONTEXTUAL_LITERT_CONTEXT_TOKENS", "8192"))
+LITERT_DEFAULT_MAX_COMPLETION_TOKENS = int(os.environ.get("CONTEXTUAL_LITERT_MAX_COMPLETION_TOKENS", "1024"))
   
   
 def resolve_figlet_font(font_name):

@@ -30,6 +30,22 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(body["stream_options"], {"include_usage": True})
         self.assertNotIn("repeat_penalty", body)
 
+    def test_litert_request_has_bounded_default_output(self):
+        model = contextual2.ChatModel("litert", "gemma4-26b")
+
+        body = contextual2.litert_request_body(
+            model,
+            [{"role": "user", "content": "Hello"}],
+            {},
+            thinking_enabled=False,
+            stream=True,
+        )
+
+        self.assertEqual(
+            body["max_completion_tokens"],
+            contextual2.LITERT_DEFAULT_MAX_COMPLETION_TOKENS,
+        )
+
     @patch("contextual2.urllib.request.urlopen")
     def test_litert_model_discovery(self, urlopen):
         urlopen.return_value = io.BytesIO(json.dumps({

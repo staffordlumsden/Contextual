@@ -216,7 +216,7 @@ This option is also available from `/switch` during a chat session.
 | `num_gpu <int>`                   | The number of layers to send to the GPU                  |
 | `stop <string>`                   | Set the stop parameter                                   |
 
-Contextual uses the same commands for both backends and translates them where necessary. LiteRT-LM supports `seed`, `num_predict`, `top_k`, `top_p` and `temperature`; `num_predict` is sent as `max_completion_tokens`. Ollama-specific settings remain available when an Ollama model is selected. `/help` lists only the parameters supported by the current backend.
+Contextual uses the same commands for both backends and translates them where necessary. LiteRT-LM supports `seed`, `num_predict`, `top_k`, `top_p` and `temperature`; `num_predict` is sent as `max_completion_tokens`. When `num_predict` has not been set, Contextual limits LiteRT-LM responses to 1,024 tokens to prevent a looping generation from occupying the local server. Set `CONTEXTUAL_LITERT_MAX_COMPLETION_TOKENS` to change that default, or use `/set parameter num_predict <value>` for the current session. Ollama-specific settings remain available when an Ollama model is selected. `/help` lists only the parameters supported by the current backend.
 
 ### Presets
 | Command              | Description                                               |
