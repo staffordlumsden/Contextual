@@ -14,7 +14,7 @@ VENV_DIR="${VENV_DIR:-$APP_DIR/venv}"
 
 # Prefer user-specified interpreter, otherwise auto-detect a sensible python3
 if [ -z "${PYTHON_CMD:-}" ]; then
-  for candidate in /opt/homebrew/bin/python3.13 python3.13 python3.12 python3 python; do
+  for candidate in /opt/homebrew/bin/python3.13 python3.13 python3.12 python3.14 python3 python; do
     if command -v "$candidate" >/dev/null 2>&1; then
       PYTHON_CMD="$(command -v "$candidate")"
       break
@@ -36,6 +36,20 @@ if [ -z "${PYTHON_CMD:-}" ] || ! command -v "$PYTHON_CMD" >/dev/null 2>&1; then
   echo_red "Error: Could not locate a python3 interpreter. Install Python 3 and/or set PYTHON_CMD."
   exit 1
 fi
+
+# Pin the interpreter: chonkie-core has wheels only up to cp314, and the
+# PyO3-based build fails outright on 3.15. Newer interpreters produce a venv
+# with no dependencies rather than a clear error.
+PY_VER="$("$PYTHON_CMD" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+case "$PY_VER" in
+  3.1[0-4]) ;;
+  *)
+    echo_red "Error: $PYTHON_CMD is Python $PY_VER; this project needs Python 3.10-3.14."
+    echo_red "Set PYTHON_CMD to a supported interpreter, e.g.:"
+    echo_red "  PYTHON_CMD=/home/linuxbrew/.linuxbrew/opt/python@3.14/bin/python3.14 ./setup.sh"
+    exit 1
+    ;;
+esac
 
 # 2) Check files
 if [ ! -f "$APP_PATH" ]; then
