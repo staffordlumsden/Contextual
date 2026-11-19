@@ -40,6 +40,7 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.application import get_app  
 import threading  
 import queue
+import atexit
 from dataclasses import dataclass
 
 try:
@@ -126,7 +127,15 @@ PARAMETER_DESCRIPTIONS = {
 BACKEND_PARAMETER_SUPPORT = {
     "ollama": frozenset(VALID_GENERATION_PARAMETERS),
     "litert": frozenset({"seed", "num_predict", "top_k", "top_p", "temperature"}),
+    "afm": frozenset({"num_predict", "temperature"}),
 }
+
+AFM_BASE_URL_ENV = "CONTEXTUAL_AFM_BASE_URL"
+DEFAULT_AFM_BASE_URL = "http://127.0.0.1:1976/v1"
+AFM_MODEL_ID = "system"
+AFM_MODEL_DISPLAY_NAME = "AFM3 Core Advanced"
+AFM_SERVER_START_TIMEOUT_SECONDS = 15
+_afm_server_process = None
 
 
 @dataclass(frozen=True)
@@ -138,15 +147,89 @@ class ChatModel:
 
     @property
     def backend_label(self):
-        return "LiteRT-LM" if self.backend == "litert" else "Ollama"
+        return {"litert": "LiteRT-LM", "afm": "Apple Foundation Models"}.get(self.backend, "Ollama")
+
+    @property
+    def display_name(self):
+        if self.backend == "afm" and self.model == AFM_MODEL_ID:
+            return AFM_MODEL_DISPLAY_NAME
+        return self.model
 
     def __str__(self):
-        return self.model
+        return self.display_name
 
 
 def litert_base_url():
     """Return the configured LiteRT-LM OpenAI-compatible API base URL."""
     return os.environ.get(LITERT_BASE_URL_ENV, DEFAULT_LITERT_BASE_URL).rstrip("/")
+
+
+def afm_base_url():
+    """Return the Apple Foundation Models Chat Completions base URL."""
+    return os.environ.get(AFM_BASE_URL_ENV, DEFAULT_AFM_BASE_URL).rstrip("/")
+
+
+def _afm_server_models():
+    request = urllib.request.Request(f"{afm_base_url()}/models")
+    with urllib.request.urlopen(request, timeout=1) as response:
+        payload = json.load(response)
+    return [item["id"] for item in payload.get("data", []) if item.get("id")]
+
+
+def ensure_afm_server():
+    """Reuse or start Apple's local Foundation Models server on first use."""
+    global _afm_server_process
+    try:
+        if AFM_MODEL_ID in _afm_server_models():
+            return
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        pass
+
+    if afm_base_url() != DEFAULT_AFM_BASE_URL:
+        raise RuntimeError(
+            f"Apple Foundation Models is not available at {afm_base_url()}. "
+            "Contextual only starts fm serve for its default local endpoint."
+        )
+    if _afm_server_process is None or _afm_server_process.poll() is not None:
+        fm_executable = shutil.which("fm")
+        if not fm_executable:
+            raise RuntimeError("The Apple Foundation Models CLI ('fm') is not installed or not on PATH.")
+        try:
+            _afm_server_process = subprocess.Popen(
+                [fm_executable, "serve", "--host", "127.0.0.1", "--port", "1976"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"Could not start 'fm serve': {exc}") from exc
+
+    deadline = time.monotonic() + AFM_SERVER_START_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if _afm_server_process.poll() is not None:
+            raise RuntimeError(
+                "'fm serve' exited before its API became available. Check the Foundation Models CLI "
+                "and macOS model availability."
+            )
+        try:
+            if AFM_MODEL_ID in _afm_server_models():
+                return
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            time.sleep(0.2)
+            continue
+        raise RuntimeError(
+            f"A server is responding at {afm_base_url()}, but it does not advertise the '{AFM_MODEL_ID}' model."
+        )
+    raise RuntimeError(f"Timed out waiting for 'fm serve' at {afm_base_url()}/models.")
+
+
+def _stop_afm_server():
+    """Stop only an AFM server process started by this Contextual process."""
+    if _afm_server_process is not None and _afm_server_process.poll() is None:
+        _afm_server_process.terminate()
+
+
+atexit.register(_stop_afm_server)
 
 
 def _http_error_message(exc):
@@ -327,10 +410,69 @@ def litert_chat_stream(chat_model, messages, generation_parameters, thinking_ena
     }
 
 
+def afm_request_body(chat_model, messages, generation_parameters, stream):
+    """Build a conservative OpenAI-compatible request for Apple's local endpoint."""
+    settings = effective_parameters(chat_model, generation_parameters)
+    body = {
+        "model": chat_model.model,
+        "messages": messages,
+        "stream": stream,
+    }
+    if "num_predict" in settings:
+        body["max_tokens"] = settings["num_predict"]
+    if "temperature" in settings:
+        body["temperature"] = settings["temperature"]
+    return body
+
+
+def afm_chat_stream(chat_model, messages, generation_parameters):
+    """Yield Apple Foundation Models stream events in Contextual's UI format."""
+    ensure_afm_server()
+    body = afm_request_body(chat_model, messages, generation_parameters, stream=True)
+    request = urllib.request.Request(
+        f"{afm_base_url()}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+    usage = {}
+    try:
+        with urllib.request.urlopen(request, timeout=LITERT_INFERENCE_TIMEOUT_SECONDS) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                event = json.loads(data)
+                if event.get("error"):
+                    raise RuntimeError(str(event["error"]))
+                if event.get("usage"):
+                    usage = event["usage"]
+                for choice in event.get("choices", []):
+                    content = choice.get("delta", {}).get("content", "") or ""
+                    if content:
+                        yield {"message": {"content": content, "thinking": ""}, "done": False}
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Apple Foundation Models request failed: {_http_error_message(exc)}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot reach Apple Foundation Models at {afm_base_url()}: {exc.reason}") from exc
+
+    yield {
+        "message": {"content": "", "thinking": ""},
+        "done": True,
+        "prompt_eval_count": usage.get("prompt_tokens", 0),
+        "eval_count": usage.get("completion_tokens", 0),
+        "reasoning_tokens": 0,
+    }
+
+
 def stream_chat(chat_model, messages, generation_parameters, thinking_enabled=False):
     """Stream chat through the backend selected with the model."""
     if chat_model.backend == "litert":
         return litert_chat_stream(chat_model, messages, generation_parameters, thinking_enabled)
+    if chat_model.backend == "afm":
+        return afm_chat_stream(chat_model, messages, generation_parameters)
     return ollama.chat(
         model=chat_model.model,
         messages=messages,
@@ -351,6 +493,29 @@ def chat_once(chat_model, messages, generation_parameters, thinking_enabled=Fals
             think=thinking_enabled,
             keep_alive=MODEL_KEEP_ALIVE,
         )
+
+    if chat_model.backend == "afm":
+        ensure_afm_server()
+        body = afm_request_body(chat_model, messages, generation_parameters, stream=False)
+        request = urllib.request.Request(
+            f"{afm_base_url()}/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=LITERT_INFERENCE_TIMEOUT_SECONDS) as response:
+                payload = json.load(response)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Apple Foundation Models request failed: {_http_error_message(exc)}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Cannot reach Apple Foundation Models at {afm_base_url()}: {exc.reason}") from exc
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        usage = payload.get("usage", {})
+        return {
+            "message": {"role": "assistant", "content": content},
+            "prompt_eval_count": usage.get("prompt_tokens", 0),
+            "eval_count": usage.get("completion_tokens", 0),
+        }
 
     body = litert_request_body(chat_model, messages, generation_parameters, thinking_enabled, stream=False)
     request = urllib.request.Request(
@@ -474,9 +639,9 @@ def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
             console.print(Align.center(f"[{color}]{line}[/{color}]"))  
       
     console.print()  
-    console.print(Align.center(Text("©2026 Stafford Lumsden v. 5.0 (19 October 2026)", style="white")), highlight=False)
+    console.print(Align.center(Text("©2026 Stafford Lumsden v. 6.0 (20 November 2026)", style="white")), highlight=False)
     console.print("\n\n")  
-    console.print(Panel(Align.center("Welcome to Contextual, a feature rich CLI for local chat and RAG through Ollama and LiteRT-LM, with Ollama-compatible Hugging Face model import and local image generation."), style="bold white", border_style="white"))
+    console.print(Panel(Align.center("Welcome to Contextual, a feature rich CLI for local chat and RAG through Ollama, LiteRT-LM and Apple Foundation Models, with Ollama-compatible Hugging Face model import and local image generation."), style="bold white", border_style="white"))
   
 def print_help(chat_model=None):
     """Prints a responsive, color-coded help message with available commands."""  
@@ -873,17 +1038,18 @@ def select_chat_model(is_interactive):
 
     choices = [ChatModel("ollama", name) for name in ollama_models]
     choices.extend(ChatModel("litert", name) for name in litert_models)
+    choices.append(ChatModel("afm", AFM_MODEL_ID))
 
     if not is_interactive:
         if choices:
             return choices[0]
-        console.print(Panel("[bold red]No chat models are available from Ollama or LiteRT-LM.[/bold red]"))
+        console.print(Panel("[bold red]No chat models are available from Ollama, LiteRT-LM or Apple Foundation Models.[/bold red]"))
         return None
 
     model_lines = ["[bold cyan]Ollama served models[/bold cyan]"]
     if ollama_models:
         model_lines.extend(
-            f"[yellow]{index + 1}[/yellow]: {model.model}"
+            f"[yellow]{index + 1}[/yellow]: {model.display_name}"
             for index, model in enumerate(choices[:len(ollama_models)])
         )
     else:
@@ -894,14 +1060,18 @@ def select_chat_model(is_interactive):
     if litert_models:
         start_index = len(ollama_models)
         model_lines.extend(
-            f"[yellow]{index + 1}[/yellow]: {model.model}"
-            for index, model in enumerate(choices[start_index:], start=start_index)
+            f"[yellow]{index + 1}[/yellow]: {model.display_name}"
+            for index, model in enumerate(choices[start_index:start_index + len(litert_models)], start=start_index)
         )
     else:
         status = f"Unavailable at {litert_base_url()}: {litert_error}" if litert_error else "No chat models found"
         model_lines.append(f"[dim]{status}[/dim]")
 
+    afm_index = len(ollama_models) + len(litert_models) + 1
     model_lines.extend([
+        "",
+        "[bold green]Apple Foundation Models[/bold green]",
+        f"[yellow]{afm_index}[/yellow]: {AFM_MODEL_DISPLAY_NAME} [dim](on-device; starts fm serve when selected)[/dim]",
         "",
         "[bold green]Additional model[/bold green]",
         "[yellow]h[/yellow]: Pull a Hugging Face model into Ollama",
@@ -916,7 +1086,14 @@ def select_chat_model(is_interactive):
         if choice.isdigit():
             index = int(choice)
             if 1 <= index <= len(choices):
-                return choices[index - 1]
+                selected_model = choices[index - 1]
+                if selected_model.backend == "afm":
+                    try:
+                        ensure_afm_server()
+                    except RuntimeError as exc:
+                        console.print(Panel(f"[bold red]{exc}[/bold red]", title="[red]Apple Foundation Models unavailable[/red]"))
+                        return None
+                return selected_model
         console.print(Panel("[bold red]Invalid selection. Enter a listed number or h.[/bold red]"))
 
 def should_preload_chat_model():

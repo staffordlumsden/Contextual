@@ -1,10 +1,12 @@
 # Contextual
 
-**Version:** v. 5.0 (19 October 2026)
+**Version:** v. 6.0 (20 November 2026)
 **Author:** Stafford Lumsden  
 **Project site:** https://staffordlumsden.github.io/Contextual/  
 
-Welcome to **Contextual**, a feature rich CLI for interacting with local models served by Ollama and LiteRT-LM. Ollama-compatible Hugging Face models can also be imported from the chat-model picker.
+Welcome to **Contextual**, a feature rich CLI for interacting with local models served by Ollama, LiteRT-LM and Apple Foundation Models. Ollama-compatible Hugging Face models can also be imported from the chat-model picker.
+
+> **New in v. 6.0:** Contextual can chat with Apple’s on-device Foundation Model. Select **AFM3 Core Advanced** in the **Apple Foundation Models** section; Contextual starts `fm serve` on `127.0.0.1:1976` when needed and uses its OpenAI-compatible Chat Completions endpoint. The server is stopped when Contextual exits if Contextual started it.
 
 > **New in v. 5.0:** The chat-model picker now discovers and groups models served by Ollama and LiteRT-LM. Selecting a model selects its backend automatically. System prompts, thinking controls, presets, parameter commands, streaming and response statistics use the selected backend. Parameters unsupported by that backend are identified rather than silently passed through.
 
@@ -82,7 +84,7 @@ List available fonts with:
 - 📄 **Document Chat**: Load `.txt`, `.md`, `.docx`, `.pdf`, `.csv`, and `.xlsx` files, chunk them, and query with a chosen embedding model.
 - 🔍 **RAG (Retrieval-Augmented Generation)**: [Chonkie](https://github.com/feyninc/chonkie)-backed recursive document chunking, embedding, storage in ChromaDB, and context-aware answers.
 - 🧠 **EmbeddingGemma**: Optimized support for `task: query embedding | query:` and `task: document embedding | text:` prefixes to improve semantic retrieval.
-- 🔥 **Backend-aware Model Switching**: Select from grouped Ollama and LiteRT-LM models, or import an Ollama-compatible Hugging Face model.
+- 🔥 **Backend-aware Model Switching**: Select from grouped Ollama, LiteRT-LM and Apple Foundation Models, or import an Ollama-compatible Hugging Face model.
 - 🧮 **Token Stats and Analytics**: View session stats with `/stats`, and toggle backend response metrics with `/set verbose`.
 - 📝 **Conversation Saving**: Export chats in Markdown or plain text.
 - 🧩 **CSV Cleaning Mode**: Automatically clean and reformat CSVs for model-friendly analysis.
@@ -130,6 +132,16 @@ List available fonts with:
    ```bash
    CONTEXTUAL_LITERT_BASE_URL=http://127.0.0.1:8080/v1 ./run_chatbot.sh
    ```
+
+   ### Apple Foundation Models (macOS)
+
+   On a Mac with Apple’s Foundation Models CLI (`fm`) and the on-device model available, select **AFM3 Core Advanced** from the **Apple Foundation Models** section in Contextual’s chat-model picker. Contextual starts the server on selection (or on the first request if model preloading is disabled):
+
+   ```bash
+   fm serve --host 127.0.0.1 --port 1976
+   ```
+
+   Contextual uses `http://127.0.0.1:1976/v1` and the CLI’s `system` model identifier for AFM3 Core Advanced. It reuses a compatible server already listening there, and stops only a server process it started itself when Contextual exits. To point Contextual at a separately managed endpoint, set `CONTEXTUAL_AFM_BASE_URL` to its `/v1` URL; Contextual will not start a server at a custom URL.
 
    Contextual budgets LiteRT-LM conversation history against an 8,192-token context window by default. If a served model uses a different limit, set `CONTEXTUAL_LITERT_CONTEXT_TOKENS` to match it.
 
@@ -181,9 +193,10 @@ The model picker is divided into:
 
 - **Ollama served models** discovered from the local Ollama service.
 - **LiteRT-LM served models** discovered from its OpenAI-compatible `/v1/models` endpoint.
+- **Apple Foundation Models**, with **AFM3 Core Advanced** served locally through `fm serve` and its OpenAI-compatible Chat Completions API.
 - **Additional model**, where **h** imports an Ollama-compatible Hugging Face model into Ollama.
 
-The selected model carries its backend through general chat, document chat and `/switch`. Ollama continues to supply document embeddings even when LiteRT-LM generates the answer.
+The selected model carries its backend through general chat, document chat and `/switch`. Ollama continues to supply document embeddings while Ollama, LiteRT-LM or Apple Foundation Models generates the answer.
 
 ### Hugging Face Models
 
