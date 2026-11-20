@@ -7,6 +7,25 @@ import contextual2
 
 
 class BackendTests(unittest.TestCase):
+    @patch("contextual2.ensure_afm_server")
+    @patch("contextual2.urllib.request.urlopen")
+    def test_afm_requests_and_reads_final_stream_usage(self, urlopen, ensure_server):
+        events = [
+            {"choices": [{"delta": {"content": "OK"}}]},
+            {"choices": [], "usage": {"prompt_tokens": 59, "completion_tokens": 3}},
+        ]
+        stream = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+        urlopen.return_value = io.BytesIO(stream.encode("utf-8"))
+        chunks = list(contextual2.afm_chat_stream(
+            contextual2.ChatModel("afm", "system"),
+            [{"role": "user", "content": "Reply with OK."}], {},
+        ))
+        body = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(body["stream_options"], {"include_usage": True})
+        self.assertEqual(chunks[-1]["prompt_eval_count"], 59)
+        self.assertEqual(chunks[-1]["eval_count"], 3)
+        self.assertTrue(chunks[-1]["done"])
+
     def test_litert_parameter_translation(self):
         model = contextual2.ChatModel("litert", "gemma4-26b")
         body = contextual2.litert_request_body(

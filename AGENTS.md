@@ -2,15 +2,15 @@
 
 Context
 - Project: Contextual (contextual2.py) CLI for Ollama-based chat, RAG, and CSV cleaning.
-- Date: 24 January 2026.
-- Goal: Add image generation support using x/flux2-klein with a new startup mode.
+- Date: 20 November 2026.
+- Scope: Chat through Ollama, LiteRT-LM and Apple's on-device Foundation Models, document RAG and CSV preparation.
 
-Work completed
-- Added Image generation mode with folder picker, prompt loop, progress spinner, and image save flow.
-- Implemented /set width, /set height, /set steps, and /set seed for image parameters.
-- Reordered startup mode picker (General chat, Image generation, Chat with a document, Clean CSV, Read README).
-- Updated banner version/welcome text and README for new capabilities.
-- Defaulted image model to x/flux2-klein:9b and added model resolution fallback for installed flux variants.
-- Added image generation fallback to stream mode to avoid JSON “Extra data” parsing errors.
-- Set default steps to 4 for flux2-klein models.
-- Added macOS Terminal launch fallback for image generation to run `ollama run` externally in image mode only.
+Current requirements
+- Image generation was removed at the user's request. Do not restore it without a new request.
+- Startup modes: General chat, Chat with a document, Clean CSV, Read the README.
+- Interface: v. 7.0 [Interface] (20 November 2026), with Seoul256 colours, light/dark themes and borderless shaded sections.
+- Preserve existing local launcher changes for symbolic-link resolution.
+- Downloaded Ollama model files are managed separately from this application.
+
+Validation
+- Run `venv/bin/python -m unittest discover -s tests` and `git diff --check` after relevant changes.

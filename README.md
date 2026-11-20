@@ -1,10 +1,12 @@
 # Contextual
 
-**Version:** v. 6.0 (20 November 2026)
+**Version:** v. 7.0 [Interface] (20 November 2026)
 **Author:** Stafford Lumsden  
 **Project site:** https://staffordlumsden.github.io/Contextual/  
 
 Welcome to **Contextual**, a feature rich CLI for interacting with local models served by Ollama, LiteRT-LM and Apple Foundation Models. Ollama-compatible Hugging Face models can also be imported from the chat-model picker.
+
+> **New in v. 7.0 [Interface]:** A Seoul256 interface with coloured multiline input, borderless shaded sections and `/light` and `/dark` themes. The status area shows context capacity, approximate context remaining and colour-coded session token totals. Long responses leave only their completed Markdown rendering in scrollback, and Apple Foundation Models token reporting is fixed. Image generation has been removed.
 
 > **New in v. 6.0:** Contextual can chat with Apple’s on-device Foundation Model. Select **AFM3 Core Advanced** in the **Apple Foundation Models** section; Contextual starts `fm serve` on `127.0.0.1:1976` when needed and uses its OpenAI-compatible Chat Completions endpoint. The server is stopped when Contextual exits if Contextual started it.
 
@@ -14,7 +16,7 @@ Welcome to **Contextual**, a feature rich CLI for interacting with local models 
 
 > **Speed note:** Contextual warms the selected chat model on startup and after `/switch`, moving the cold model-load wait before the first user prompt. Disable this behaviour with `CONTEXTUAL_PRELOAD_CHAT_MODEL=0 ./run_chatbot.sh`.
 
-> **Windows support note:** Contextual now includes PowerShell setup and runner scripts (`setup_windows.ps1` and `run_chatbot.ps1`). Chat, RAG, CSV, and image generation are intended to run on Windows with Ollama for Windows; image generation opens PowerShell on Windows, Terminal on macOS, and a detected terminal emulator on Linux.
+> **Windows support note:** Contextual now includes PowerShell setup and runner scripts (`setup_windows.ps1` and `run_chatbot.ps1`). Chat, RAG and CSV preparation run on Windows with Ollama for Windows.
 
 ---
 
@@ -88,7 +90,6 @@ List available fonts with:
 - 🧮 **Token Stats and Analytics**: View session stats with `/stats`, and toggle backend response metrics with `/set verbose`.
 - 📝 **Conversation Saving**: Export chats in Markdown or plain text.
 - 🧩 **CSV Cleaning Mode**: Automatically clean and reformat CSVs for model-friendly analysis.
-- 🖼️ **Image Generation**: Opens a platform terminal window to run `ollama run x/flux2-klein:9b` with your prompt and saves images to the selected folder. After generation, return to Contextual and press Enter to import and list the new PNGs.
 
 ---
 
@@ -115,7 +116,6 @@ List available fonts with:
    ```bash
    ollama pull gemma3n
    ollama pull embeddinggemma
-   ollama pull x/flux2-klein
    ```
 
    You can also run Ollama-compatible Hugging Face models directly from the chat model picker by selecting **h** and pasting:
@@ -176,6 +176,32 @@ List available fonts with:
 | `/stats`             | Display session statistics                               |
 | `/save`              | Save the current conversation to a file                  |
 | `/new`               | Start a new chat session                                 |
+| `/light` / `/dark`   | Switch Contextual's input and label colours for light or dark terminals |
+
+The dark interface uses colours from Seoul256. Startup, help and confirmation messages use borderless shaded sections. The dark
+theme uses a black terminal background. `/light` and `/dark` change the interface
+and request the corresponding terminal background for the current session. The
+terminal profile is not edited, and its default background is restored on exit
+in terminals that support these colour escape sequences. The active input area and status line resize with the
+terminal; earlier output remains in terminal scrollback.
+
+Switching themes redraws the active conversation using the new palette. Response
+text follows the terminal background without fixed colour blocks; only input,
+interface sections and code blocks have deliberate shaded backgrounds.
+
+Long replies use a temporary streaming preview showing the latest lines that fit
+on screen. When generation finishes, the preview is cleared and the complete
+formatted response is printed once, keeping partial redraws out of scrollback.
+
+The input status area shows the context budget, approximate percentage remaining,
+and cumulative session input/output tokens. Remaining context uses the latest
+request's reported input plus output tokens, rather than cumulative usage; it
+does not include the prompt currently being typed. Ollama uses an explicit
+`num_ctx` setting or the loaded model's reported context length. LiteRT-LM uses
+`CONTEXTUAL_LITERT_CONTEXT_TOKENS`. Apple's local `system` model uses its documented
+[4,096-token shared budget](https://developer.apple.com/documentation/technotes/tn3193-managing-the-on-device-foundation-model-s-context-window);
+`CONTEXTUAL_AFM_CONTEXT_TOKENS` can override that for a custom endpoint. Unknown
+budgets or unavailable usage produce `n/a` for the remaining percentage.
 
 ### Model
 | Command              | Description                                               |
@@ -268,7 +294,7 @@ $env:CONTEXTUAL_PRELOAD_CHAT_MODEL="0"
 .\run_chatbot.ps1
 ```
 
-Use `/set verbose` to toggle a backend metrics box under each model response. Available metrics include:
+Use `/set verbose` to toggle a backend metrics section under each model response. Available metrics include:
 
 - First chunk time
 - TTFT
@@ -276,24 +302,6 @@ Use `/set verbose` to toggle a backend metrics box under each model response. Av
 - Prompt eval time and prompt eval rate
 - Generation time and output rate
 - Backend-reported evaluation and total time, when available
-
-### Image Generation
-| Command              | Description                                               |
-|----------------------|-----------------------------------------------------------|
-| `/set width <n>`     | Set image width in pixels                                |
-| `/set height <n>`    | Set image height in pixels                               |
-| `/set steps <n>`     | Set diffusion steps (fewer is faster, more adds detail)  |
-| `/set seed <n>`      | Set a random seed for reproducible results               |
-
-#### How Image Generation Works
-1. Select **Image generation** from the startup mode picker.
-2. Choose a folder where images should be saved.
-3. Enter a prompt; Contextual opens a platform terminal window and runs:
-   ```bash
-   ollama run x/flux2-klein:9b --verbose --width <n> --height <n> --steps <n> --seed <n> "your prompt"
-   ```
-4. When the terminal finishes and saves the image, return to Contextual and press Enter.
-5. Contextual scans the selected folder and lists newly created PNG files.
 
 ### Input
 | Key Combination      | Description                                               |

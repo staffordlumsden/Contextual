@@ -5,14 +5,15 @@ import os
 import docx  
 from PyPDF2 import PdfReader  
 from rich.console import Console  
-from rich.panel import Panel  
+from rich.theme import Theme
+from rich.padding import Padding
+from rich.segment import Segment
 from rich.markdown import Markdown  
 from rich.prompt import Prompt, IntPrompt  
 from rich.align import Align  
 from rich.columns import Columns  
 from rich.table import Table  
 from rich.text import Text  
-from rich.rule import Rule  
 from rich.spinner import Spinner  
 import sys  
 import argparse  
@@ -23,12 +24,10 @@ import io
 from pick import pick  
 import chromadb  
 import re  
-import base64  
 import json  
 import urllib.request  
 import urllib.error  
 import subprocess  
-import tempfile  
 import shutil  
 import shlex  
 from rich.progress import track, ProgressBar  
@@ -38,9 +37,13 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings  
 from prompt_toolkit.filters import Condition  
 from prompt_toolkit.application import get_app  
+from prompt_toolkit.styles import Style as PromptStyle
+from prompt_toolkit.output import ColorDepth
+from prompt_toolkit.utils import get_cwidth
 import threading  
 import queue
 import atexit
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 try:
@@ -271,6 +274,102 @@ def inactive_parameter_names(chat_model, generation_parameters):
     supported = supported_parameters(chat_model)
     return sorted(name for name in generation_parameters if name not in supported)
 
+def context_window_size(chat_model, generation_parameters):
+    """Resolve the active context budget, rather than a model's theoretical maximum."""
+    if chat_model.backend == "litert":
+        return LITERT_CONTEXT_WINDOW_TOKENS
+    if chat_model.backend == "afm":
+        # Apple's on-device system model has a shared 4,096-token budget.
+        # https://developer.apple.com/documentation/technotes/tn3193-managing-the-on-device-foundation-model-s-context-window
+        override = os.environ.get("CONTEXTUAL_AFM_CONTEXT_TOKENS")
+        if override:
+            try:
+                return max(1, int(override))
+            except ValueError:
+                return None
+        return 4096 if chat_model.model == "system" and afm_base_url() == DEFAULT_AFM_BASE_URL else None
+    if generation_parameters.get("num_ctx", 0) > 0:
+        return generation_parameters["num_ctx"]
+    try:
+        client = ollama.Client(timeout=2)
+        running = client.ps()
+        for model in running.get("models", []):
+            if model.get("model") in (chat_model.model, chat_model.model + ":latest"):
+                size = model.get("context_length")
+                if isinstance(size, int) and size > 0:
+                    return size
+    except Exception:
+        pass
+    return None
+
+def chat_status(chat_model, mode, last_status, context_size, context_used, input_tokens, output_tokens):
+    capacity = f"{context_size:,}" if context_size else "unknown"
+    remaining = "n/a"
+    if context_size and context_used is not None:
+        percent = max(0, min(100, 100 * (1 - context_used / context_size)))
+        remaining = f"~{percent:.1f}%"
+    return (f"{chat_model} · {mode} · {last_status} · "
+            f"Context {capacity} · {remaining} left · In {input_tokens:,} / Out {output_tokens:,}")
+
+def status_toolbar(status, width):
+    """Lay out coloured fields across the available terminal width."""
+    fields = []
+    for index, value in enumerate(re.split(r" · | / (?=Out )", str(status).replace("\n", " · "))):
+        kind = "model" if index == 0 else "muted"
+        if value.startswith("Context "):
+            kind = "context"
+        elif value.endswith(" left"):
+            kind = "remaining"
+        elif value.startswith("In "):
+            kind = "in"
+        elif value.startswith("Out "):
+            kind = "out"
+        elif value.startswith("Response ") or value == "Ready":
+            kind = "timing"
+        fields.append((f"class:status-{kind}", value))
+    fields.append(("class:status-muted", f"{ui_theme} · Esc+Enter"))
+    width = max(1, width)
+    if (any(style == "class:status-in" for style, _ in fields)
+            and sum(get_cwidth(text) for _, text in fields) + 3 * (len(fields) - 1) > width):
+        # Prioritize model and usage so normal-width windows need just one row.
+        fields = [(style, text) for style, text in fields
+                  if style not in ("class:status-muted", "class:status-timing")]
+    rows, row, used = [], [], 0
+    for style, value in fields:
+        # Split oversized fields by display cells, including wide Unicode.
+        parts, part, cells = [], "", 0
+        for char in value:
+            size = get_cwidth(char)
+            if cells + size > width and part:
+                parts.append(part)
+                part, cells = "", 0
+            part += char
+            cells += size
+        parts.append(part)
+        for part in parts:
+            size = get_cwidth(part)
+            if row and used + 3 + size > width:
+                rows.append(row)
+                row, used = [], 0
+            used += size + (3 if row else 0)
+            row.append((style, part))
+    if row:
+        rows.append(row)
+    fragments = []
+    for index, row in enumerate(rows):
+        if index:
+            fragments.append(("", "\n"))
+        spare = max(0, width - sum(get_cwidth(text) for _, text in row) - 3 * (len(row) - 1))
+        gaps = max(1, len(row) - 1)
+        for column, field in enumerate(row):
+            if column:
+                padding = spare // gaps + (1 if column <= spare % gaps else 0)
+                fragments.append(("class:status-muted", " · " + " " * padding))
+            fragments.append(field)
+        if len(row) == 1:
+            fragments.append(("", " " * spare))
+    return fragments
+
 
 def _truncate_message_content(content, limit):
     """Keep the instruction-bearing start and the latest part of an oversized message."""
@@ -325,7 +424,7 @@ def prepare_litert_messages(messages, generation_parameters):
         prepared_message.get("content") != original.get("content")
         for prepared_message, original in zip(prepared, messages)
     ):
-        console.print(Panel(
+        console.print(interface_section(
             "Older conversation content was trimmed to fit LiteRT-LM's context window.",
             title="[yellow]Context Window[/yellow]",
             border_style="yellow",
@@ -406,6 +505,7 @@ def litert_chat_stream(chat_model, messages, generation_parameters, thinking_ena
         "done": True,
         "prompt_eval_count": usage.get("prompt_tokens", 0),
         "eval_count": usage.get("completion_tokens", 0),
+        "usage_available": "prompt_tokens" in usage and "completion_tokens" in usage,
         "reasoning_tokens": reasoning_tokens,
     }
 
@@ -418,6 +518,8 @@ def afm_request_body(chat_model, messages, generation_parameters, stream):
         "messages": messages,
         "stream": stream,
     }
+    if stream:
+        body["stream_options"] = {"include_usage": True}
     if "num_predict" in settings:
         body["max_tokens"] = settings["num_predict"]
     if "temperature" in settings:
@@ -463,6 +565,7 @@ def afm_chat_stream(chat_model, messages, generation_parameters):
         "done": True,
         "prompt_eval_count": usage.get("prompt_tokens", 0),
         "eval_count": usage.get("completion_tokens", 0),
+        "usage_available": "prompt_tokens" in usage and "completion_tokens" in usage,
         "reasoning_tokens": 0,
     }
 
@@ -547,6 +650,137 @@ def chat_once(chat_model, messages, generation_parameters, thinking_enabled=Fals
   
 # Create the prompt session lazily so non-interactive commands stay quiet.
 session = None
+UI_THEMES = {
+    "dark": {"input_bg": "#4e4e4e", "input_fg": "#d0d0d0", "accent": "#85add4", "status": "#d7af5f", "status_bg": "#3a3a3a", "muted": "#b2b2b2", "error": "#d68787", "secondary": "#87afaf", "background": "#000000", "section_bg": "#262626", "selector_bg": "#303030"},
+    "light": {"input_bg": "#e4e4dc", "input_fg": "#303030", "accent": "#365f87", "status": "#805f00", "status_bg": "#f4f4ed", "muted": "#66665e", "error": "#a34242", "secondary": "#3e6868", "background": "#f4f4ed", "section_bg": "#e4e4dc", "selector_bg": "#d6d6ce"},
+}
+ui_theme = "dark"
+rich_theme_applied = False
+
+def set_ui_theme(command):
+    """Handle appearance commands without changing the host terminal profile."""
+    global ui_theme
+    name = command.strip().lower().removeprefix("/")
+    if name not in UI_THEMES or command.strip().lower() not in ("/dark", "/light"):
+        return False
+    ui_theme = name
+    apply_rich_theme()
+    if terminal_background_active:
+        set_terminal_background()
+    return True
+
+def apply_rich_theme():
+    """Use the selected palette for Rich panels, prompts, and messages."""
+    global rich_theme_applied
+    colors = UI_THEMES[ui_theme]
+    palette = {
+        "white": colors["input_fg"], "grey50": colors["muted"],
+        "grey70": colors["muted"], "green": colors["accent"],
+        "bright_green": colors["accent"], "blue": colors["accent"],
+        "bright_blue": colors["accent"], "cyan": colors["secondary"],
+        "bright_cyan": colors["secondary"], "yellow": colors["status"],
+        "bright_yellow": colors["status"], "magenta": colors["secondary"],
+        "light_purple": colors["secondary"], "purple": colors["secondary"],
+        "bright_magenta": colors["secondary"], "red": colors["error"],
+        "bright_red": colors["error"],
+    }
+    styles = dict(palette)
+    for name, color in palette.items():
+        styles[f"bold {name}"] = f"bold {color}"
+        styles[f"italic {name}"] = f"italic {color}"
+    styles.update({"prompt": colors["accent"], "prompt.choices": colors["muted"],
+                   "prompt.default": colors["status"],
+                   "markdown.text": colors["input_fg"],
+                   "markdown.paragraph": colors["input_fg"],
+                   "markdown.h1": f"bold underline {colors['accent']}",
+                   "markdown.h2": f"bold {colors['accent']}",
+                   "markdown.h3": f"bold {colors['secondary']}",
+                   "markdown.h4": f"italic {colors['secondary']}",
+                   "markdown.block_quote": colors["secondary"],
+                   "markdown.link": colors["accent"],
+                   "markdown.link_url": f"underline {colors['accent']}",
+                   "markdown.table.border": colors["secondary"],
+                   "markdown.table.header": f"bold {colors['accent']}",
+                   "markdown.list": colors["secondary"],
+                   "markdown.item.number": colors["secondary"],
+                   "markdown.kbd": f"bold {colors['status']}",
+                   "markdown.code": f"{colors['secondary']} on {colors['section_bg']}",
+                   "markdown.code_block": f"{colors['input_fg']} on {colors['section_bg']}"})
+    if rich_theme_applied:
+        console.pop_theme()
+    console.push_theme(Theme(styles))
+    rich_theme_applied = True
+    # Let the terminal background show through instead of stamping coloured
+    # rectangles into scrollback for every response line.
+    console.style = colors["input_fg"]
+
+def themed_markdown(content):
+    return Markdown(content, style=UI_THEMES[ui_theme]["input_fg"],
+                    code_theme="friendly" if ui_theme == "light" else "monokai")
+
+def response_view(model, answer, thinking=""):
+    colors = UI_THEMES[ui_theme]
+    items = [Text(str(model), style=f"bold {colors['accent']}")]
+    if thinking:
+        items.extend([Text("Thinking...", style=f"italic {colors['secondary']}"),
+                      Text(thinking, style=colors["secondary"]), Text("")])
+    items.append(themed_markdown(answer))
+    return Group(*items)
+
+def redraw_conversation(transcript):
+    """Re-render the active conversation from content using the new palette."""
+    console.clear()
+    for turn in transcript:
+        console.print(interface_section(Text(turn["prompt"]), shade="input_bg"))
+        if "answer" in turn:
+            console.print(response_view(turn["model"], turn["answer"], turn.get("thinking", "")))
+
+def interface_section(content, title=None, style=None, border_style=None,
+                      expand=True, shade="section_bg", **kwargs):
+    """Separate interface sections with full-width colour rather than borders."""
+    colors = UI_THEMES[ui_theme]
+    items = []
+    if title:
+        heading = Text.from_markup(title, style=f"bold {colors['accent']}") if isinstance(title, str) else title
+        items.extend([heading, Text("")])
+    items.append(Text.from_markup(content) if isinstance(content, str) else content)
+    return Padding(Group(*items), (1, 2),
+                   style=console.get_style(f"{colors['input_fg']} on {colors[shade]}") + console.get_style(style or "none"), expand=True)
+
+terminal_background_active = False
+
+def set_terminal_background():
+    """Set the running terminal background; restore its profile colour on exit."""
+    global terminal_background_active
+    if sys.stdout.isatty():
+        colors = UI_THEMES[ui_theme]
+        sys.stdout.write(f"\033]10;{colors['input_fg']}\007\033]11;{colors['background']}\007")
+        sys.stdout.flush()
+        terminal_background_active = True
+
+def restore_terminal_background():
+    if terminal_background_active:
+        sys.stdout.write("\033]110\007\033]111\007")
+        sys.stdout.flush()
+
+atexit.register(restore_terminal_background)
+
+def prompt_theme_style():
+    colors = UI_THEMES[ui_theme]
+    return PromptStyle.from_dict({
+        "input-area": f"{colors['input_fg']} bg:{colors['input_bg']}",
+        "prompt": f"bold {colors['accent']} bg:{colors['input_bg']}",
+        "placeholder": f"{colors['input_fg']} bg:{colors['input_bg']}",
+        "bottom-toolbar": f"noreverse {colors['status']} bg:{colors['status_bg']}",
+        "bottom-toolbar.text": f"noreverse {colors['status']} bg:{colors['status_bg']}",
+        "status-model": f"bold {colors['accent']}",
+        "status-context": colors["secondary"],
+        "status-remaining": colors["status"],
+        "status-timing": colors["input_fg"],
+        "status-muted": colors["muted"],
+        "status-in": "bold #87af87" if ui_theme == "dark" else "bold #426642",
+        "status-out": f"bold {colors['error']}",
+    })
   
 # Setup key bindings for multiline input  
 bindings = KeyBindings()  
@@ -578,13 +812,42 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')  
   
 console = Console()  
+apply_rich_theme()
 DEFAULT_FIGLET_FONT = "4max"
 FIGLET_FONT_ENV = "CONTEXTUAL_FIGLET_FONT"
-IMAGE_MODEL = "x/flux2-klein:9b"  
-IMAGE_DEFAULT_WIDTH = 1024  
-IMAGE_DEFAULT_HEIGHT = 1024  
 # Keep live streaming smooth without redrawing the terminal on every model chunk.
 STREAM_RENDER_INTERVAL_SECONDS = 0.25
+
+class StreamingPreview:
+    """Keep redraws inside the viewport so they cannot enter scrollback."""
+    def __init__(self, renderable):
+        self.renderable = renderable
+
+    def __rich_console__(self, console, options):
+        # Leave room for cursor movement and the final Live cleanup.
+        height = max(1, options.size.height - 2)
+        lines = console.render_lines(self.renderable, options.update(height=None), pad=False)
+        if len(lines) > height:
+            notice = Text("… streaming preview; full response appears when complete", style="grey70")
+            if height > 1:
+                lines = console.render_lines(notice, options.update(height=1), pad=False)[:1] + lines[-(height - 1):]
+            else:
+                lines = lines[-1:]
+        for index, line in enumerate(lines):
+            if index:
+                yield Segment.line()
+            yield from line
+
+@contextmanager
+def streaming_display():
+    """Erase the temporary preview, including on interruption or backend errors."""
+    with Live(console=console, auto_refresh=False, vertical_overflow="crop", transient=True) as live:
+        try:
+            yield live
+        finally:
+            # Rich switches to visible overflow in stop(); clear before that.
+            live.update(Text(""), refresh=True)
+
 MODEL_KEEP_ALIVE = "30m"
 PRELOAD_CHAT_MODEL_ENV = "CONTEXTUAL_PRELOAD_CHAT_MODEL"
 HF_MODEL_PREFIX = "hf.co/"
@@ -614,11 +877,11 @@ def resolve_figlet_font(font_name):
 
 
 def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
-    """Prints a colorful, responsive Figlet banner for the chatbot."""  
+    """Print a responsive banner in the selected interface palette."""
     console.print("\n\n")  
     width = console.width  
     if width < 80:  # Threshold for when to switch to a simpler banner  
-        console.print(Panel(Align.center("Contextual"), style="bold white", border_style="white"))  
+        console.print(interface_section(Align.center("Contextual"), style="bold green"))
     else:  
         resolved_font = resolve_figlet_font(figlet_font)
         try:
@@ -626,27 +889,18 @@ def print_banner(figlet_font=DEFAULT_FIGLET_FONT):
         except pyfiglet.FontNotFound:
             banner_text = pyfiglet.figlet_format("Contextual", font="standard", width=int(width * 0.9))
         lines = banner_text.split('\n')  
-        rainbow_colors = [  
-            "bold bright_red",  
-            "bold bright_yellow",  
-            "bold bright_green",  
-            "bold bright_cyan",  
-            "bold bright_blue",  
-            "bold bright_magenta"  
-        ]  
-        for i, line in enumerate(lines):  
-            color = rainbow_colors[i % len(rainbow_colors)]  
-            console.print(Align.center(f"[{color}]{line}[/{color}]"))  
+        for line in lines:
+            console.print(Align.center(Text(line, style=f"bold {UI_THEMES[ui_theme]['accent']}")))
       
     console.print()  
-    console.print(Align.center(Text("©2026 Stafford Lumsden v. 6.0 (20 November 2026)", style="white")), highlight=False)
+    console.print(Align.center(Text("©2026 Stafford Lumsden v. 7.0 [Interface] (20 November 2026)", style="white")), highlight=False)
     console.print("\n\n")  
-    console.print(Panel(Align.center("Welcome to Contextual, a feature rich CLI for local chat and RAG through Ollama, LiteRT-LM and Apple Foundation Models, with Ollama-compatible Hugging Face model import and local image generation."), style="bold white", border_style="white"))
+    console.print(interface_section(Align.center("Contextual: a feature rich CLI for local chat, RAG and data prep using local LLMs served by Ollama, LiteRT-LM and Apple's on device Foundation Models or pull a model from Huggingface."), style="bold white", border_style="white"))
   
 def print_help(chat_model=None):
     """Prints a responsive, color-coded help message with available commands."""  
     table = Table.grid(expand=True, padding=(0, 2))  
-    table.add_column(width=34)  # Command column
+    table.add_column(width=min(34, max(12, (console.width - 8) // 2)))  # Command column
     table.add_column()          # Description column  
   
     # Helper to add a section  
@@ -662,6 +916,7 @@ def print_help(chat_model=None):
         ("/stats", "Display session statistics"),  
         ("/save", "Save the current conversation to a file"),  
         ("/new", "Start a new chat session"),  
+        ("/light or /dark", "Change Contextual's input and label colours"),
     ])  
   
     # Model Section  
@@ -678,14 +933,6 @@ def print_help(chat_model=None):
         ("/file", "Switch to a different document for chat"),  
         ("/csv", "Clean and load a CSV file for chat"),  
         ("/chunks N", "Set the number of document chunks to retrieve"),  
-    ])  
-  
-    # Image Section  
-    add_section("Image", "bright_blue", [  
-        ("/set width <n>", "Set image width in pixels (image mode)"),  
-        ("/set height <n>", "Set image height in pixels (image mode)"),  
-        ("/set steps <n>", "Set image diffusion steps (image mode)"),  
-        ("/set seed <n>", "Set image random seed (image mode)"),  
     ])  
   
     # Decoding & Runtime Section  
@@ -717,7 +964,7 @@ def print_help(chat_model=None):
         ("/exit or /quit", "Exit the application"),  
     ])  
   
-    console.print(Panel(table, title="[bold]Help Menu[/bold]", border_style="white", expand=True))  
+    console.print(interface_section(table, title="[bold]Help Menu[/bold]", border_style="white", expand=True))
   
 def print_stats(start_time, model, file_name, turns, input_tokens, output_tokens, generation_parameters, is_document_chat):
     """Prints the session statistics and model parameters side-by-side."""  
@@ -744,8 +991,8 @@ def print_stats(start_time, model, file_name, turns, input_tokens, output_tokens
     if inactive:
         params_text += f"\n\nInactive for {model.backend_label}: {', '.join(inactive)}"
   
-    stats_panel = Panel(stats_text, title="[bold green]Session Statistics[/bold green]", border_style="white", style="white")  
-    params_panel = Panel(params_text, title="[bold yellow]Model Parameters[/bold yellow]", border_style="yellow", style="yellow")  
+    stats_panel = interface_section(stats_text, title="[bold green]Session Statistics[/bold green]", border_style="white", style="white")
+    params_panel = interface_section(params_text, title="[bold yellow]Model Parameters[/bold yellow]", border_style="yellow", style="yellow")
   
     console.print(Columns([stats_panel, params_panel]))  
   
@@ -810,7 +1057,7 @@ def select_embedding_model(is_interactive):
         available_models = [model['model'] for model in models_info['models'] 
                             if any(s in model['model'].lower() for s in ('embed', 'embedding'))]  
         if not available_models:  
-            console.print(Panel("[bold red]No embedding models found. Please install one (e.g., 'ollama pull nomic-embed-text').[/bold red]"))  
+            console.print(interface_section("[bold red]No embedding models found. Please install one (e.g., 'ollama pull nomic-embed-text').[/bold red]"))
             return None  
   
         if is_interactive:  
@@ -819,14 +1066,14 @@ def select_embedding_model(is_interactive):
                 available_models.insert(0, available_models.pop(available_models.index(default_model)))  
               
             model_list = "\n".join(f"[yellow]{i + 1}[/yellow]: {model_name}" for i, model_name in enumerate(available_models))  
-            console.print(Panel(model_list, title="[bold green]Select an Embedding Model[/bold green]", expand=True))  
+            console.print(interface_section(model_list, title="[bold green]Select an Embedding Model[/bold green]", shade="input_bg"))
             choice = IntPrompt.ask("Select a model", choices=[str(i+1) for i in range(len(available_models))], default=1)  
             return available_models[choice - 1]  
         else:  
             return "nomic-embed-text"  
   
     except Exception as e:  
-        console.print(Panel(f"[bold red]Error fetching embedding models: {e}[/bold red]"))  
+        console.print(interface_section(f"[bold red]Error fetching embedding models: {e}[/bold red]"))
         return None  
   
 def is_huggingface_model_ref(model_name):
@@ -905,7 +1152,7 @@ def render_pull_progress(model_ref, status, percent, recent_lines):
         progress_text = f"Progress: {percent}%"
 
     lines = [
-        Rule(title=f"[bold green]{model_ref}[/bold green]", style="white"),
+        Text(model_ref, style="bold green"),
         Align.center(Spinner("dots", text=Text("Pulling Hugging Face model with Ollama...", style="yellow"))),
         Text(progress_text, style="bold cyan"),
     ]
@@ -913,8 +1160,8 @@ def render_pull_progress(model_ref, status, percent, recent_lines):
         lines.append(Text(status, style="white"))
     if recent_lines:
         lines.append(Text("\n".join(recent_lines[-5:]), style="grey70"))
-    lines.append(Rule(title=Text("This can take a while on first use", style="bold yellow"), style="white", align="right"))
-    return Group(*lines)
+    lines.append(Text("This can take a while on first use", style="yellow"))
+    return interface_section(Group(*lines))
 
 
 def ensure_huggingface_model_available(model_ref):
@@ -962,20 +1209,20 @@ def ensure_huggingface_model_available(model_ref):
             returncode = process.wait()
             live.update(render_pull_progress(model_ref, status, percent, output_lines), refresh=True)
     except FileNotFoundError:
-        console.print(Panel("[bold red]Ollama CLI not found. Install Ollama or add it to PATH.[/bold red]"))
+        console.print(interface_section("[bold red]Ollama CLI not found. Install Ollama or add it to PATH.[/bold red]"))
         return False
     except Exception as exc:
-        console.print(Panel(f"[bold red]Could not prepare Hugging Face model: {exc}[/bold red]"))
+        console.print(interface_section(f"[bold red]Could not prepare Hugging Face model: {exc}[/bold red]"))
         return False
 
     if returncode == 0:
-        console.print(Panel(f"Hugging Face model ready: [bold]{model_ref}[/bold]", title="[green]Model Ready[/green]", expand=False))
+        console.print(interface_section(f"Hugging Face model ready: [bold]{model_ref}[/bold]", title="[green]Model Ready[/green]", expand=False))
         return True
 
     output = "\n".join(output_lines).strip()
     if len(output) > 1200:
         output = output[-1200:]
-    console.print(Panel(
+    console.print(interface_section(
         f"[bold red]Ollama could not pull this Hugging Face model.[/bold red]\n\n{output}\n\n"
         f"Try the exact command from Hugging Face, for example:\n"
         f"ollama run {model_ref}",
@@ -997,7 +1244,7 @@ def select_huggingface_chat_model():
         "   hf.co/{username}/{repository}:{quantization}\n\n"
         "Contextual also accepts owner/repository:quantization and normalizes quantization tags to uppercase."
     )
-    console.print(Panel(instructions, title="[bold green]Hugging Face Model[/bold green]", border_style="green", expand=True))
+    console.print(interface_section(instructions, title="[bold green]Hugging Face Model[/bold green]", border_style="green", expand=True))
 
     while True:
         raw_value = get_multiline_input(
@@ -1005,17 +1252,17 @@ def select_huggingface_chat_model():
             placeholder="Paste ollama run hf.co/... here. Press Enter on a blank line to submit.",
         )
         if not raw_value.strip():
-            console.print(Panel("[bold yellow]Hugging Face model entry cancelled.[/bold yellow]"))
+            console.print(interface_section("[bold yellow]Hugging Face model entry cancelled.[/bold yellow]"))
             return None
 
         model_ref, error = normalize_huggingface_model_entry(raw_value)
         if model_ref:
             if ensure_huggingface_model_available(model_ref):
-                console.print(Panel(f"Using Hugging Face model: [bold]{model_ref}[/bold]", title="[green]Model Selected[/green]", expand=False))
+                console.print(interface_section(f"Using Hugging Face model: [bold]{model_ref}[/bold]", title="[green]Model Selected[/green]", expand=False))
                 return ChatModel("ollama", model_ref)
             continue
 
-        console.print(Panel(f"[bold red]{error}[/bold red]"))
+        console.print(interface_section(f"[bold red]{error}[/bold red]"))
 
 
 def select_chat_model(is_interactive):  
@@ -1043,7 +1290,7 @@ def select_chat_model(is_interactive):
     if not is_interactive:
         if choices:
             return choices[0]
-        console.print(Panel("[bold red]No chat models are available from Ollama, LiteRT-LM or Apple Foundation Models.[/bold red]"))
+        console.print(interface_section("[bold red]No chat models are available from Ollama, LiteRT-LM or Apple Foundation Models.[/bold red]"))
         return None
 
     model_lines = ["[bold cyan]Ollama served models[/bold cyan]"]
@@ -1076,7 +1323,7 @@ def select_chat_model(is_interactive):
         "[bold green]Additional model[/bold green]",
         "[yellow]h[/yellow]: Pull a Hugging Face model into Ollama",
     ])
-    console.print(Panel("\n".join(model_lines), title="[bold green]Select a Chat Model[/bold green]", expand=True))
+    console.print(interface_section("\n".join(model_lines), title="[bold green]Select a Chat Model[/bold green]", shade="input_bg"))
 
     default_choice = "1" if choices else "h"
     while True:
@@ -1091,10 +1338,10 @@ def select_chat_model(is_interactive):
                     try:
                         ensure_afm_server()
                     except RuntimeError as exc:
-                        console.print(Panel(f"[bold red]{exc}[/bold red]", title="[red]Apple Foundation Models unavailable[/red]"))
+                        console.print(interface_section(f"[bold red]{exc}[/bold red]", title="[red]Apple Foundation Models unavailable[/red]"))
                         return None
                 return selected_model
-        console.print(Panel("[bold red]Invalid selection. Enter a listed number or h.[/bold red]"))
+        console.print(interface_section("[bold red]Invalid selection. Enter a listed number or h.[/bold red]"))
 
 def should_preload_chat_model():
     """Return whether interactive chat should warm the model before the first prompt."""
@@ -1110,10 +1357,9 @@ def warm_chat_model(chat_model):
     try:
         with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:
             live.update(
-                Group(
-                    Rule(title=f"[bold green]{chat_model}[/bold green]", style="white"),
-                    Align.center(Spinner("dots", text=Text("Warming model...", style="yellow"))),
-                    Rule(title=Text("Preparing first response", style="bold yellow"), style="white", align="right"),
+                interface_section(
+                    Spinner("dots", text=Text("Warming model… Preparing first response", style="yellow")),
+                    title=Text(str(chat_model), style="bold green"),
                 ),
                 refresh=True,
             )
@@ -1132,9 +1378,9 @@ def warm_chat_model(chat_model):
                     {"num_predict": 2, "temperature": 0.0},
                     thinking_enabled=False,
                 )
-        console.print(Panel(f"Model warmed in {time.time() - start:.2f}s.", title="[bold green]Ready[/bold green]", border_style="green", expand=False))
+        console.print(interface_section(f"Model warmed in {time.time() - start:.2f}s.", title="[bold green]Ready[/bold green]", border_style="green", expand=False))
     except Exception as e:
-        console.print(Panel(f"[bold yellow]Model warm-up skipped: {e}[/bold yellow]", title="[yellow]Warm-up Warning[/yellow]", expand=False))
+        console.print(interface_section(f"[bold yellow]Model warm-up skipped: {e}[/bold yellow]", title="[yellow]Warm-up Warning[/yellow]", expand=False))
   
 def sanitize_collection_name(name):  
     """Sanitizes a string to be a valid ChromaDB collection name."""  
@@ -1189,7 +1435,7 @@ def create_chroma_collection(file_path, file_content, embedding_model):
 def select_and_load_file(file_path=None, embedding_model=None):  
     """Handles file selection, loading, and embedding."""  
     if file_path is None and not sys.stdout.isatty():  
-        console.print(Panel("[bold red]Error: No file path provided in non-interactive mode.[/bold red]"))  
+        console.print(interface_section("[bold red]Error: No file path provided in non-interactive mode.[/bold red]"))
         return None, None, None  
   
     while True:  
@@ -1197,10 +1443,10 @@ def select_and_load_file(file_path=None, embedding_model=None):
             if sys.stdout.isatty():  
                 file_path = open_file_picker()  
                 if not file_path:  
-                    console.print(Panel("[bold yellow]No file selected. Returning to main menu.[/bold yellow]"))  
+                    console.print(interface_section("[bold yellow]No file selected. Returning to main menu.[/bold yellow]"))
                     return None, None, None  
             else:  
-                console.print(Panel("[bold red]Error: No file path provided in non-interactive mode.[/bold red]"))  
+                console.print(interface_section("[bold red]Error: No file path provided in non-interactive mode.[/bold red]"))
                 return None, None, None  
           
         try:  
@@ -1208,10 +1454,10 @@ def select_and_load_file(file_path=None, embedding_model=None):
             collection, num_chunks = create_chroma_collection(file_path, content, embedding_model)  
               
             file_basename = os.path.basename(file_path)  
-            console.print(Panel(f"[bold green]Successfully loaded:[/] [white]{file_basename}[/white] and divided into [bold red]{num_chunks}[/bold red] chunks.", expand=False))  
+            console.print(interface_section(f"[bold green]Successfully loaded:[/] [white]{file_basename}[/white] and divided into [bold red]{num_chunks}[/bold red] chunks.", expand=False))
             return content, file_path, collection  
         except (FileNotFoundError, ValueError, chromadb.errors.InvalidArgumentError) as e:  
-            console.print(Panel(f"[bold red]Error: {e}[/bold red]"))  
+            console.print(interface_section(f"[bold red]Error: {e}[/bold red]"))
             if not sys.stdout.isatty() or file_path:  
                 return None, None, None  
             file_path = None  
@@ -1227,7 +1473,7 @@ def open_file_picker():
         try:  
             items = os.listdir(current_path)  
         except PermissionError:  
-            console.print(Panel(f"[bold red]Permission denied: {current_path}[/bold red]"))  
+            console.print(interface_section(f"[bold red]Permission denied: {current_path}[/bold red]"))
             current_path = os.path.abspath(os.path.join(current_path, '..'))  
             continue  
           
@@ -1267,86 +1513,28 @@ def open_file_picker():
         # It's a file  
         return os.path.join(current_path, selected)  
   
-def open_folder_picker():  
-    """Displays an interactive folder picker to browse and select a directory."""  
-    current_path = os.path.abspath('.')  
-  
-    while True:  
-        title = f"Select a folder from: {current_path} (or cancel)"  
-        try:  
-            items = os.listdir(current_path)  
-        except PermissionError:  
-            console.print(Panel(f"[bold red]Permission denied: {current_path}[/bold red]"))  
-            current_path = os.path.abspath(os.path.join(current_path, '..'))  
-            continue  
-  
-        options = []  
-        parent_path = os.path.abspath(os.path.join(current_path, '..'))  
-        if parent_path != current_path:  
-            options.append("../ (Parent Directory)")  
-  
-        options.append("[Select this folder]")  
-  
-        dirs = sorted([d for d in items if os.path.isdir(os.path.join(current_path, d))])  
-        for d in dirs:  
-            options.append(f"[DIR] {d}")  
-  
-        options.append("[Cancel]")  
-  
-        selected, index = pick(options, title, indicator='=>')  
-  
-        if selected == "[Cancel]" or index is None:  
-            return None  
-  
-        if selected == "../ (Parent Directory)":  
-            current_path = parent_path  
-            continue  
-  
-        if selected == "[Select this folder]":  
-            return current_path  
-  
-        if selected.startswith("[DIR] "):  
-            dir_name = selected[6:]  
-            current_path = os.path.join(current_path, dir_name)  
-            continue  
-  
-def resolve_image_model(preferred_model):  
-    """Resolve an installed image model, preferring flux2-klein variants."""  
-    try:  
-        models_info = ollama.list()  
-        available_models = [model['model'] for model in models_info.get('models', [])]  
-    except Exception as e:  
-        console.print(Panel(f"[bold red]Error fetching models: {e}[/bold red]"))  
-        return None  
-  
-    if preferred_model in available_models:  
-        return preferred_model  
-  
-    flux_variants = [m for m in available_models if "flux2-klein" in m]  
-    if not flux_variants:  
-        return None  
-  
-    if "x/flux2-klein:9b" in flux_variants:  
-        return "x/flux2-klein:9b"  
-    if "x/flux2-klein" in flux_variants:  
-        return "x/flux2-klein"  
-  
-    return flux_variants[0]  
-  
 def get_multiline_input(
     prompt_text="> ",
-    placeholder="Enter your prompt. Press [Meta+Enter] or [Esc] then [Enter] to submit.",
+    placeholder="Enter your prompt…",
+    status="Contextual",
 ):
     """Gets multi-line input from the user using prompt_toolkit."""  
     global session
     if session is None:
         session = PromptSession()
+    session.app.layout.current_window.style = "class:input-area"
+    session.app.layout.current_window.dont_extend_height = Condition(lambda: True)
+    def toolbar():
+        return status_toolbar(status, session.app.output.get_size().columns)
     return session.prompt(  
-        prompt_text,
-        placeholder=placeholder,
+        [("class:prompt", prompt_text)],
+        placeholder=[("class:placeholder", placeholder)],
         multiline=True,  
         key_bindings=bindings,  
-        prompt_continuation="... "  
+        prompt_continuation=[("class:prompt", "... ")],
+        bottom_toolbar=toolbar,
+        style=prompt_theme_style(),
+        color_depth=ColorDepth.TRUE_COLOR,
     )  
   
 from rich.progress_bar import ProgressBar  
@@ -1354,10 +1542,10 @@ from rich.progress_bar import ProgressBar
 def save_conversation(messages, model, file_name, is_document_chat):  
     """Saves the conversation to a file."""  
     if not messages:  
-        console.print(Panel("[bold yellow]Conversation is empty. Nothing to save.[/bold yellow]"))  
+        console.print(interface_section("[bold yellow]Conversation is empty. Nothing to save.[/bold yellow]"))
         return  
   
-    console.print(Panel("Select format: [1] Markdown (.md) [2] Plain Text (.txt)", title="[bold green]Save Conversation[/bold green]"))  
+    console.print(interface_section("Select format: [1] Markdown (.md) [2] Plain Text (.txt)", title="[bold green]Save Conversation[/bold green]"))
     format_choice = Prompt.ask("Choose format", choices=["1", "2"], default="1")  
     file_extension = ".md" if format_choice == "1" else ".txt"  
       
@@ -1392,374 +1580,9 @@ def save_conversation(messages, model, file_name, is_document_chat):
     try:  
         with open(filename, 'w', encoding='utf-8') as f:  
             f.write(content)  
-        console.print(Panel(f"Conversation saved to [bold green]{filename}[/bold green]"))  
+        console.print(interface_section(f"Conversation saved to [bold green]{filename}[/bold green]"))
     except Exception as e:  
-        console.print(Panel(f"[bold red]Error saving file: {e}[/bold red]"))  
-  
-def print_image_help():  
-    """Prints help for image generation mode."""  
-    table = Table.grid(expand=True, padding=(0, 2))  
-    table.add_column(width=24)  
-    table.add_column()  
-  
-    table.add_row(Text("Image Generation", style="bold green"), "")  
-    table.add_row(Text("/set width <n>", style="white"), Text("Set image width in pixels", style="white"))  
-    table.add_row(Text("/set height <n>", style="white"), Text("Set image height in pixels", style="white"))  
-    table.add_row(Text("/set steps <n>", style="white"), Text("Set number of diffusion steps", style="white"))  
-    table.add_row(Text("/set seed <n>", style="white"), Text("Set a random seed for reproducibility", style="white"))  
-    table.add_row()  
-    table.add_row(Text("General", style="bold yellow"), "")  
-    table.add_row(Text("/help", style="white"), Text("Display this help message", style="white"))  
-    table.add_row(Text("/new", style="white"), Text("Return to the main menu", style="white"))  
-    table.add_row(Text("/exit or /quit", style="white"), Text("Exit the application", style="white"))  
-  
-    console.print(Panel(table, title="[bold]Image Mode Help[/bold]", border_style="white", expand=True))  
-  
-def render_image_settings(image_state, model_name):  
-    steps = image_state.get("steps")  
-    seed = image_state.get("seed")  
-    steps_text = str(steps) if steps is not None else "default"  
-    seed_text = str(seed) if seed is not None else "random"  
-    return (  
-        f"Model: {model_name}\n"  
-        f"Width: {image_state['width']} | Height: {image_state['height']}\n"  
-        f"Steps: {steps_text} | Seed: {seed_text}"  
-    )  
-  
-def build_image_options(image_state):  
-    options = {  
-        "width": image_state["width"],  
-        "height": image_state["height"],  
-    }  
-    if image_state.get("steps") is not None:  
-        options["steps"] = image_state["steps"]  
-    if image_state.get("seed") is not None:  
-        options["seed"] = image_state["seed"]  
-    return options  
-  
-def decode_image_payload(payload):  
-    if not payload:  
-        return []  
-    if isinstance(payload, dict):  
-        if payload.get("images"):  
-            return payload["images"]  
-        data = payload.get("data")  
-        if isinstance(data, list):  
-            return [item.get("b64_json") for item in data if isinstance(item, dict) and item.get("b64_json")]  
-    return []  
-  
-def generate_images_v1(model_name, prompt, size, options):  
-    """Generate images via the OpenAI-compatible endpoint."""  
-    payload = {  
-        "model": model_name,  
-        "prompt": prompt,  
-        "size": size,  
-        "n": 1,  
-    }  
-    if options.get("steps") is not None:  
-        payload["steps"] = options["steps"]  
-    if options.get("seed") is not None:  
-        payload["seed"] = options["seed"]  
-  
-    data = json.dumps(payload).encode("utf-8")  
-    req = urllib.request.Request(  
-        "http://localhost:11434/v1/images/generations",  
-        data=data,  
-        headers={"Content-Type": "application/json"},  
-        method="POST",  
-    )  
-  
-    with urllib.request.urlopen(req, timeout=120) as resp:  
-        body = resp.read().decode("utf-8")  
-    return decode_image_payload(json.loads(body))  
-  
-def generate_images_cli(model_name, prompt, work_dir, options):  
-    """Generate images via the Ollama CLI and return saved file paths."""  
-    try:  
-        args = ["ollama", "run", model_name, "--verbose"]  
-        if options.get("width"):  
-            args += ["--width", str(options["width"])]  
-        if options.get("height"):  
-            args += ["--height", str(options["height"])]  
-        if options.get("steps") is not None:  
-            args += ["--steps", str(options["steps"])]  
-        if options.get("seed") is not None:  
-            args += ["--seed", str(options["seed"])]  
-        args.append(prompt)  
-  
-        result = subprocess.run(  
-            args,  
-            text=True,  
-            capture_output=True,  
-            cwd=work_dir,  
-            timeout=300,  
-        )  
-    except FileNotFoundError:  
-        return []  
-    except subprocess.TimeoutExpired:  
-        return []  
-  
-    output = (result.stdout or "") + "\n" + (result.stderr or "")  
-    paths = []  
-    for line in output.splitlines():  
-        if "Image saved to:" in line:  
-            path = line.split("Image saved to:", 1)[1].strip()  
-            if not os.path.isabs(path):  
-                path = os.path.join(work_dir, path)  
-            paths.append(path)  
-    if paths:  
-        return paths  
-  
-    for name in os.listdir(work_dir):  
-        if name.lower().endswith(".png"):  
-            paths.append(os.path.join(work_dir, name))  
-    return paths  
-  
-def generate_images(model_name, prompt, options):  
-    """Generate images with Ollama, trying the images API first."""  
-    size = f"{options.get('width', IMAGE_DEFAULT_WIDTH)}x{options.get('height', IMAGE_DEFAULT_HEIGHT)}"  
-    try:  
-        images = generate_images_v1(model_name, prompt, size, options)  
-        if images:  
-            return images, []  
-    except urllib.error.HTTPError:  
-        pass  
-    except urllib.error.URLError:  
-        pass  
-    except Exception:  
-        pass  
-  
-    try:  
-        response = ollama.generate(model=model_name, prompt=prompt, options=options, stream=False)  
-        images = decode_image_payload(response if isinstance(response, dict) else None)  
-        if images:  
-            return images, []  
-    except json.JSONDecodeError:  
-        pass  
-    except Exception as e:  
-        if "Extra data" not in str(e):  
-            raise  
-  
-    images = []  
-    response_stream = ollama.generate(model=model_name, prompt=prompt, options=options, stream=True)  
-    for chunk in response_stream:  
-        chunk_images = decode_image_payload(chunk)  
-        if chunk_images:  
-            images.extend(chunk_images)  
-    if images:  
-        return images, []  
-  
-    with tempfile.TemporaryDirectory(prefix="contextual_images_") as tmpdir:  
-        paths = generate_images_cli(model_name, prompt, tmpdir, options)  
-    return [], paths  
-
-def powershell_quote(value):
-    """Quote a string for use as a PowerShell single-quoted literal."""
-    return "'" + str(value).replace("'", "''") + "'"
-  
-def launch_external_terminal_image(prompt, model_name, options, save_dir):  
-    """Open a platform terminal window to run ollama image generation in the shell."""  
-    args = ["ollama", "run", model_name, "--verbose"]  
-    if options.get("width"):  
-        args += ["--width", str(options["width"])]  
-    if options.get("height"):  
-        args += ["--height", str(options["height"])]  
-    if options.get("steps") is not None:  
-        args += ["--steps", str(options["steps"])]  
-    if options.get("seed") is not None:  
-        args += ["--seed", str(options["seed"])]  
-    args.append(prompt)  
-
-    try:
-        if sys.platform == "darwin":
-            cmd = " ".join(shlex.quote(a) for a in args)
-            terminal_cmd = f"cd {shlex.quote(save_dir)}; {cmd}"
-            terminal_cmd = terminal_cmd.replace('"', '\\"')
-            subprocess.run(
-                ["osascript", "-e", f'tell application "Terminal" to do script "{terminal_cmd}"'],
-                check=False,
-            )
-            return True
-
-        if os.name == "nt":
-            ps_args = " ".join(powershell_quote(a) for a in args)
-            ps_command = (
-                f"Set-Location -LiteralPath {powershell_quote(save_dir)}; "
-                f"& {ps_args}"
-            )
-            subprocess.Popen(
-                [
-                    "cmd",
-                    "/c",
-                    "start",
-                    "Contextual Image Generation",
-                    "powershell",
-                    "-NoExit",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    ps_command,
-                ],
-                cwd=save_dir,
-            )
-            return True
-
-        cmd = " ".join(shlex.quote(a) for a in args)
-        terminal_cmd = f"cd {shlex.quote(save_dir)}; {cmd}; printf '\\nPress Enter to close...'; read _"
-        terminal_candidates = [
-            ["x-terminal-emulator", "-e", "bash", "-lc", terminal_cmd],
-            ["gnome-terminal", "--", "bash", "-lc", terminal_cmd],
-            ["konsole", "-e", "bash", "-lc", terminal_cmd],
-            ["xfce4-terminal", "-e", f"bash -lc {shlex.quote(terminal_cmd)}"],
-            ["xterm", "-e", "bash", "-lc", terminal_cmd],
-        ]
-        for candidate in terminal_candidates:
-            if shutil.which(candidate[0]):
-                subprocess.Popen(candidate, cwd=save_dir)
-                return True
-        return False
-    except Exception:
-        return False  
-  
-def parse_image_set_command(user_message, image_state):  
-    parts = user_message.strip().split()  
-    if len(parts) != 3:  
-        return False, "Invalid command. Use /set width <n>, /set height <n>, /set steps <n>, or /set seed <n>."  
-  
-    _, key, value = parts  
-    key = key.lower()  
-  
-    if key not in {"width", "height", "steps", "seed"}:  
-        return False, f"Invalid image parameter: {key}."  
-  
-    if not value.isdigit():  
-        return False, "Value must be a non-negative integer."  
-  
-    num = int(value)  
-    if key in {"width", "height", "steps"} and num <= 0:  
-        return False, "Value must be greater than zero."  
-  
-    image_state[key] = num  
-    return True, f"Image parameter [bold]{key}[/bold] set to [bold]{num}[/bold]."  
-  
-def handle_image_generation():  
-    """Runs the image generation loop using the x/flux2-klein model."""  
-    resolved_model = resolve_image_model(IMAGE_MODEL)  
-    if not resolved_model:  
-        console.print(Panel("[bold red]No installed flux2-klein image model found. Pull x/flux2-klein:9b (or another variant) and try again.[/bold red]"))  
-        return False  
-  
-    console.print(Panel("Select a folder to save generated images.", title="[bold green]Image Generation[/bold green]"))  
-    save_dir = open_folder_picker()  
-    if not save_dir:  
-        console.print(Panel("[bold yellow]No folder selected. Returning to main menu.[/bold yellow]"))  
-        return False  
-  
-    image_state = {  
-        "width": IMAGE_DEFAULT_WIDTH,  
-        "height": IMAGE_DEFAULT_HEIGHT,  
-        "steps": 4 if "flux2-klein" in resolved_model else None,  
-        "seed": None,  
-    }  
-  
-    console.print(Panel(render_image_settings(image_state, resolved_model), title="[bold green]Current Image Settings[/bold green]"))  
-    console.print(Panel("Enter an image prompt. Use /set width|height|steps|seed to adjust parameters.", style="bold white"))  
-  
-    use_external_terminal = True  
-  
-    while True:  
-        console.print(Rule(title="[bold purple]Image Prompt[/bold purple]", style="white"))  
-        user_message = get_multiline_input()  
-  
-        if not user_message.strip():  
-            continue  
-  
-        lower = user_message.lower().strip()  
-        if lower in ['/exit', '/quit']:  
-            return True  
-        if lower == '/new':  
-            return False  
-        if lower == '/help':  
-            print_image_help()  
-            continue  
-        if lower.startswith('/set '):  
-            ok, message = parse_image_set_command(user_message, image_state)  
-            if ok:  
-                console.print(Panel(message, style="bold yellow"))  
-                console.print(Panel(render_image_settings(image_state, resolved_model), title="[bold green]Current Image Settings[/bold green]"))  
-            else:  
-                console.print(Panel(f"[bold red]{message}[/bold red]"))  
-            continue  
-  
-        options = build_image_options(image_state)  
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  
-  
-        try:  
-            if use_external_terminal:  
-                existing = {f for f in os.listdir(save_dir) if f.lower().endswith(".png")}  
-                launched = launch_external_terminal_image(user_message, resolved_model, options, save_dir)  
-                if not launched:  
-                    console.print(Panel("[bold red]Failed to launch a terminal for image generation.[/bold red]"))  
-                    continue  
-  
-                console.print(Panel("A terminal window opened. Generate the image there. Press Enter here when it finishes to import.", style="bold yellow"))  
-                Prompt.ask("")  
-  
-                new_files = []  
-                for name in os.listdir(save_dir):  
-                    if not name.lower().endswith(".png"):  
-                        continue  
-                    if name not in existing:  
-                        new_files.append(os.path.join(save_dir, name))  
-  
-                if not new_files:  
-                    console.print(Panel("[bold red]No new images found in the selected folder.[/bold red]"))  
-                    continue  
-  
-                saved_list = "\n".join(f"[white]{path}[/white]" for path in new_files)  
-                console.print(Panel(f"Saved {len(new_files)} image(s):\n{saved_list}", title="[bold green]Image Saved[/bold green]"))  
-                continue  
-  
-            with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:  
-                response_start_time = time.time()  
-                spinner = Spinner("dots", text=Text("Generating image...", style="yellow"))  
-                live.update(  
-                    Group(  
-                        Rule(title=f"[bold green]{resolved_model}[/bold green]", style="white"),  
-                        Align.center(spinner),  
-                        Rule(title=Text("Time: 0.00s", style="bold yellow"), style="white", align="right"),  
-                    ),  
-                    refresh=True,  
-                )  
-                images, file_paths = generate_images(resolved_model, user_message, options)  
-  
-            saved_files = []  
-            if images:  
-                for idx, image_b64 in enumerate(images, start=1):  
-                    image_bytes = base64.b64decode(image_b64)  
-                    filename = f"contextual_{timestamp}_{idx}.png"  
-                    output_path = os.path.join(save_dir, filename)  
-                    with open(output_path, "wb") as f:  
-                        f.write(image_bytes)  
-                    saved_files.append(output_path)  
-            elif file_paths:  
-                for idx, path in enumerate(file_paths, start=1):  
-                    if not os.path.exists(path):  
-                        continue  
-                    filename = f"contextual_{timestamp}_{idx}.png"  
-                    output_path = os.path.join(save_dir, filename)  
-                    shutil.copy2(path, output_path)  
-                    saved_files.append(output_path)  
-  
-            if not saved_files:  
-                console.print(Panel("[bold red]No image data returned. Ensure the model is installed and supports image generation.[/bold red]"))  
-                continue  
-  
-            saved_list = "\n".join(f"[white]{path}[/white]" for path in saved_files)  
-            console.print(Panel(f"Saved {len(saved_files)} image(s):\n{saved_list}", title="[bold green]Image Saved[/bold green]"))  
-  
-        except Exception as e:  
-            console.print(Panel(f"[bold red]Image generation failed: {e}[/bold red]"))  
+        console.print(interface_section(f"[bold red]Error saving file: {e}[/bold red]"))
   
 def handle_chat_interaction(chat_model, is_document_chat, generation_parameters, **kwargs):
     """Handles the main chat loop for both document and general chat modes."""  
@@ -1778,16 +1601,30 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
     embedding_model = kwargs.get("embedding_model")  
     file_path = kwargs.get("file_path")  
     n_results = 5  
+    last_status = "Ready"
+    context_used = 0
+    context_limit = None
+    context_key = None
+    transcript = []
   
     if current_mode_is_doc_chat:  
-        console.print(Panel(f"Retrieving the top [bold]{n_results}[/bold] relevant chunks for each query. Use [bold]/chunks N[/bold] to change.", style="dim", expand=False))  
+        console.print(interface_section(f"Retrieving the top [bold]{n_results}[/bold] relevant chunks for each query. Use [bold]/chunks N[/bold] to change.", style="dim", expand=False))
   
     while True:  
-        console.print(Rule(title="[bold purple]You[/bold purple]", style="white"))  
-        user_message = get_multiline_input()  
+        mode_label = "Document chat" if current_mode_is_doc_chat else "Chat"
+        key = (chat_model, generation_parameters.get("num_ctx"))
+        if key != context_key:
+            context_limit = context_window_size(chat_model, generation_parameters)
+            context_key = key
+        user_message = get_multiline_input(status=chat_status(
+            chat_model, mode_label, last_status, context_limit, context_used, input_tokens, output_tokens,
+        ))
   
         if not user_message.strip():  
             continue  
+        if set_ui_theme(user_message):
+            redraw_conversation(transcript)
+            continue
   
         if user_message.lower().strip() in ['/exit', '/quit']:  
             return True  
@@ -1795,32 +1632,33 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
             return False  
   
         if user_message.lower().strip() == '/prompt':  
-            console.print(Panel("Enter your custom system prompt. Press [Meta+Enter] or [Esc] followed by [Enter] to submit.", title="[bold green]Set System Prompt[/bold green]"))  
+            console.print(interface_section("Enter your custom system prompt. Press [Meta+Enter] or [Esc] followed by [Enter] to submit.", title="[bold green]Set System Prompt[/bold green]"))
             user_system_prompt = get_multiline_input()  
-            console.print(Panel(f"System prompt set to: \n\n[italic]{user_system_prompt}[/italic]", style="bold yellow"))  
+            context_used = None
+            console.print(interface_section(f"System prompt set to: \n\n[italic]{user_system_prompt}[/italic]", style="bold yellow"))
             continue  
   
   
         if user_message.lower().strip() == '/file':  
-            console.print(Panel("Please select an embedding model.", title="[bold green]Switching to Document Chat[/bold green]"))  
+            console.print(interface_section("Please select an embedding model.", title="[bold green]Switching to Document Chat[/bold green]"))
             embedding_model = select_embedding_model(True)  
             if not embedding_model:  
-                console.print(Panel("[bold yellow]Embedding model selection cancelled. Returning to chat.[/bold yellow]"))  
+                console.print(interface_section("[bold yellow]Embedding model selection cancelled. Returning to chat.[/bold yellow]"))
                 continue  
   
-            console.print(Panel("Please select a new file.", title="[bold green]Switching File[/bold green]"))  
+            console.print(interface_section("Please select a new file.", title="[bold green]Switching File[/bold green]"))
             new_content, new_path, new_collection = select_and_load_file(embedding_model=embedding_model)  
             if new_content:  
                 collection, file_path = new_collection, new_path  
                 current_mode_is_doc_chat = True  
                 messages, turns = [], 0  
-                console.print(Panel(f"Switched to document chat with file: [bold]{os.path.basename(file_path)}[/bold]", title="[green]Mode Switched[/green]", expand=False))  
+                console.print(interface_section(f"Switched to document chat with file: [bold]{os.path.basename(file_path)}[/bold]", title="[green]Mode Switched[/green]", expand=False))
             else:  
-                console.print(Panel("[bold yellow]File switch cancelled. Returning to chat.[/bold yellow]"))  
+                console.print(interface_section("[bold yellow]File switch cancelled. Returning to chat.[/bold yellow]"))
             continue  
   
         if user_message.lower().strip() == '/csv':  
-            console.print(Panel("Select a CSV file to clean and load.", title="[bold green]CSV Mode[/bold green]"))  
+            console.print(interface_section("Select a CSV file to clean and load.", title="[bold green]CSV Mode[/bold green]"))
             csv_path = open_file_picker()  
             if csv_path:  
                 try:  
@@ -1848,12 +1686,12 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                     skipped_params = sorted(set(csv_cleaning_params) - set(applied_params))
                     if skipped_params:
                         params_text += f"\n\nNot supported by {chat_model.backend_label}: {', '.join(skipped_params)}"
-                    console.print(Panel(params_text, title="[bold yellow]Default Parameters for Cleaned CSV Applied[/bold yellow]", border_style="yellow", style="yellow"))  
+                    console.print(interface_section(params_text, title="[bold yellow]Default Parameters for Cleaned CSV Applied[/bold yellow]", border_style="yellow", style="yellow"))
                       
-                    console.print(Panel("Now, please select an embedding model.", title="[bold green]Switching to Document Chat[/bold green]"))  
+                    console.print(interface_section("Now, please select an embedding model.", title="[bold green]Switching to Document Chat[/bold green]"))
                     embedding_model = select_embedding_model(True)  
                     if not embedding_model:  
-                        console.print(Panel("[bold yellow]Embedding model selection cancelled. Returning to chat.[/bold yellow]"))  
+                        console.print(interface_section("[bold yellow]Embedding model selection cancelled. Returning to chat.[/bold yellow]"))
                         continue  
   
                     new_content, new_path, new_collection = select_and_load_file(file_path=cleaned_path, embedding_model=embedding_model)  
@@ -1861,14 +1699,14 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                         collection, file_path = new_collection, new_path  
                         current_mode_is_doc_chat = True  
                         messages, turns = [], 0  
-                        console.print(Panel(f"Switched to document chat with file: [bold]{os.path.basename(file_path)}[/bold]", title="[green]Mode Switched[/green]", expand=False))  
+                        console.print(interface_section(f"Switched to document chat with file: [bold]{os.path.basename(file_path)}[/bold]", title="[green]Mode Switched[/green]", expand=False))
                     else:  
-                        console.print(Panel("[bold yellow]File switch cancelled. Returning to chat.[/bold yellow]"))  
+                        console.print(interface_section("[bold yellow]File switch cancelled. Returning to chat.[/bold yellow]"))
   
                 except Exception as e:  
-                    console.print(Panel(f"[bold red]Error processing CSV: {e}[/bold red]"))  
+                    console.print(interface_section(f"[bold red]Error processing CSV: {e}[/bold red]"))
             else:  
-                console.print(Panel("[bold yellow]No file selected. Returning to chat.[/bold yellow]"))  
+                console.print(interface_section("[bold yellow]No file selected. Returning to chat.[/bold yellow]"))
             continue  
   
         if user_message.lower().strip().startswith('/chunks') and current_mode_is_doc_chat:  
@@ -1876,11 +1714,11 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                 parts = user_message.strip().split()  
                 if len(parts) > 1 and parts[1].isdigit():  
                     n_results = int(parts[1])  
-                    console.print(Panel(f"Number of chunks to retrieve set to [bold]{n_results}[/bold].", style="bold yellow"))  
+                    console.print(interface_section(f"Number of chunks to retrieve set to [bold]{n_results}[/bold].", style="bold yellow"))
                 else:  
-                    console.print(Panel("[bold red]Invalid command. Use /chunks N, where N is a number.[/bold red]"))  
+                    console.print(interface_section("[bold red]Invalid command. Use /chunks N, where N is a number.[/bold red]"))
             except Exception as e:  
-                console.print(Panel(f"[bold red]Error setting chunks: {e}[/bold red]"))  
+                console.print(interface_section(f"[bold red]Error setting chunks: {e}[/bold red]"))
             continue  
           
         if user_message.lower().strip().startswith('/set '):  
@@ -1889,16 +1727,16 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                 command = parts[1].lower()  
                 if command == 'think':  
                     thinking_enabled = True  
-                    console.print(Panel(f"Thinking mode [bold green]enabled[/bold green] for {chat_model.backend_label}.", title="[yellow]Mode Changed[/yellow]"))
+                    console.print(interface_section(f"Thinking mode [bold green]enabled[/bold green] for {chat_model.backend_label}.", title="[yellow]Mode Changed[/yellow]"))
                     continue  
                 elif command == 'nothink':  
                     thinking_enabled = False  
-                    console.print(Panel(f"Thinking mode [bold red]disabled[/bold red] for {chat_model.backend_label}.", title="[yellow]Mode Changed[/yellow]"))
+                    console.print(interface_section(f"Thinking mode [bold red]disabled[/bold red] for {chat_model.backend_label}.", title="[yellow]Mode Changed[/yellow]"))
                     continue  
                 elif command == 'verbose':  
                     verbose_enabled = not verbose_enabled  
                     state = "[bold green]enabled[/bold green]" if verbose_enabled else "[bold red]disabled[/bold red]"  
-                    console.print(Panel(f"Response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))
+                    console.print(interface_section(f"Response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))
                     continue  
   
                 preset_name = parts[1]  
@@ -1910,9 +1748,9 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                     skipped = sorted(set(preset) - set(applied))
                     if skipped:
                         params_text += f"\n\nNot supported by {chat_model.backend_label}: {', '.join(skipped)}"
-                    console.print(Panel(params_text, title=f"[bold yellow]'{preset_name.capitalize()}' Preset Applied[/bold yellow]", border_style="yellow", style="yellow"))  
+                    console.print(interface_section(params_text, title=f"[bold yellow]'{preset_name.capitalize()}' Preset Applied[/bold yellow]", border_style="yellow", style="yellow"))
                 else:  
-                    console.print(Panel(f"[bold red]Invalid preset or command: {preset_name}[/bold red]"))  
+                    console.print(interface_section(f"[bold red]Invalid preset or command: {preset_name}[/bold red]"))
             elif len(parts) == 3 and parts[1].lower() == "verbose":
                 value = parts[2].lower()
                 if value in {"on", "true", "yes", "1"}:
@@ -1920,16 +1758,16 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                 elif value in {"off", "false", "no", "0"}:
                     verbose_enabled = False
                 else:
-                    console.print(Panel("[bold red]Invalid verbose value. Use /set verbose, /set verbose on, or /set verbose off.[/bold red]"))
+                    console.print(interface_section("[bold red]Invalid verbose value. Use /set verbose, /set verbose on, or /set verbose off.[/bold red]"))
                     continue
                 state = "[bold green]enabled[/bold green]" if verbose_enabled else "[bold red]disabled[/bold red]"
-                console.print(Panel(f"Response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))
+                console.print(interface_section(f"Response analytics {state}.", title="[yellow]Mode Changed[/yellow]"))
             elif len(parts) >= 4 and parts[1] == "parameter":  
                 param_name = parts[2]
                 param_value = " ".join(parts[3:])
                 if param_name in VALID_GENERATION_PARAMETERS:
                     if param_name not in supported_parameters(chat_model):
-                        console.print(Panel(
+                        console.print(interface_section(
                             f"[bold red]Parameter {param_name} is not supported by {chat_model.backend_label}.[/bold red]\n"
                             f"Use /help to see parameters available for the selected backend."
                         ))
@@ -1939,7 +1777,7 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                         if chat_model.backend == "litert" and param_name == "num_predict":
                             requested_tokens = int(param_value)
                             if requested_tokens > LITERT_CONTEXT_WINDOW_TOKENS - 512:
-                                console.print(Panel(
+                                console.print(interface_section(
                                     f"[bold red]num_predict must be at most {LITERT_CONTEXT_WINDOW_TOKENS - 512} "
                                     f"for the configured LiteRT-LM context window.[/bold red]"
                                 ))
@@ -1948,13 +1786,13 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                             generation_parameters[param_name] = [param_value]
                         else:  
                             generation_parameters[param_name] = param_type(param_value)
-                        console.print(Panel(f"Parameter [bold]{param_name}[/bold] set to [bold]{generation_parameters[param_name]}[/bold] for {chat_model.backend_label}.", style="bold yellow"))
+                        console.print(interface_section(f"Parameter [bold]{param_name}[/bold] set to [bold]{generation_parameters[param_name]}[/bold] for {chat_model.backend_label}.", style="bold yellow"))
                     except ValueError:  
-                        console.print(Panel(f"[bold red]Invalid value type for {param_name}. Expected {VALID_GENERATION_PARAMETERS[param_name].__name__}.[/bold red]"))
+                        console.print(interface_section(f"[bold red]Invalid value type for {param_name}. Expected {VALID_GENERATION_PARAMETERS[param_name].__name__}.[/bold red]"))
                 else:  
-                    console.print(Panel(f"[bold red]Invalid parameter: {param_name}[/bold red]"))  
+                    console.print(interface_section(f"[bold red]Invalid parameter: {param_name}[/bold red]"))
             else:  
-                console.print(Panel("[bold red]Invalid command. Use /set <preset>, /set think, /set nothink, /set verbose, or /set parameter <name> <value>.[/bold red]"))  
+                console.print(interface_section("[bold red]Invalid command. Use /set <preset>, /set think, /set nothink, /set verbose, or /set parameter <name> <value>.[/bold red]"))
             continue  
   
         if user_message.lower().strip() == '/save':  
@@ -1966,12 +1804,13 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
             new_model = select_chat_model(True)  
             if new_model:  
                 chat_model = new_model  
+                context_used = None
                 warm_chat_model(chat_model)
                 message = f"Switched to [bold]{chat_model}[/bold] via {chat_model.backend_label}."
                 inactive = inactive_parameter_names(chat_model, generation_parameters)
                 if inactive:
                     message += f"\n\nStored settings inactive for this backend: {', '.join(inactive)}"
-                console.print(Panel(message, title="[green]Model Switched[/green]", expand=False))
+                console.print(interface_section(message, title="[green]Model Switched[/green]", expand=False))
             continue  
         if user_message.lower().strip() == '/help':  
             print_help(chat_model)
@@ -1982,19 +1821,19 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
             continue  
   
         turns += 1  
+        transcript.append({"prompt": user_message, "model": chat_model})
           
         try:  
             prompt = user_message  
             metrics_panel = None  
               
-            with Live(console=console, auto_refresh=False, vertical_overflow="visible") as live:  
+            with streaming_display() as live:
                 response_start_time = time.time()  
                 spinner = Spinner("dots", text=Text("Working...", style="yellow"))  
                 live.update(  
                     Group(  
-                        Rule(title=f"[bold green]{chat_model}[/bold green]", style="white"),  
+                        Text(str(chat_model), style=f"bold {UI_THEMES[ui_theme]['accent']}"),
                         Align.center(spinner),  
-                        Rule(title=Text("Time: 0.00s", style="bold yellow"), style="white", align="right"),  
                     ),  
                     refresh=True,  
                 )  
@@ -2037,9 +1876,8 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                 spinner = Spinner("dots", text=Text("Waiting for model response...", style="yellow"))  
                 live.update(  
                     Group(  
-                        Rule(title=f"[bold green]{chat_model}[/bold green]", style="white"),  
+                        Text(str(chat_model), style=f"bold {UI_THEMES[ui_theme]['accent']}"),
                         Align.center(spinner),  
-                        Rule(title=Text("Time: 0.00s", style="bold yellow"), style="white", align="right"),  
                     ),  
                     refresh=True,  
                 )  
@@ -2059,6 +1897,7 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                 first_chunk_time = None
                 first_content_time = None
                 last_render_time = 0.0
+                timing_text = ""
   
                 for chunk in response_stream:  
                     now = time.time()
@@ -2098,12 +1937,12 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                     if thinking_text:  
                         render_items.append(Text("Thinking...", style="italic cyan"))  
                         render_items.append(Text(thinking_text, style="cyan"))  
-                        render_items.append(Rule(style="cyan"))  
+                        render_items.append(Text(""))
                       
                     if chunk.get('done'):
-                        render_items.append(Markdown(final_answer))
+                        render_items.append(themed_markdown(final_answer))
                     else:
-                        render_items.append(Text(final_answer))
+                        render_items.append(Text(final_answer, style=UI_THEMES[ui_theme]["input_fg"]))
                       
                     elapsed_time = time.time() - response_start_time  
                     timing_text = ""
@@ -2115,21 +1954,28 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                             timing_parts.append(f"TTFT: {first_content_time - response_start_time:.2f}s")
                         timing_text = f" | {' | '.join(timing_parts)}" if timing_parts else ""
                     bot_response_group = Group(  
-                        Rule(title=f"[bold green]{chat_model}[/bold green]", style="white"),  
+                        Text(str(chat_model), style=f"bold {UI_THEMES[ui_theme]['accent']}"),
                         *render_items,  
-                        Rule(title=Text(f"Time: {elapsed_time:.2f}s{timing_text}", style="bold yellow"), style="white", align="right")  
                     )  
-                    live.update(bot_response_group, refresh=True)  
+                    live.update(StreamingPreview(bot_response_group), refresh=True)
                     last_render_time = now
                       
                     if chunk.get('done'):  
                         full_response_data = chunk  
   
+                last_status = f"Response {time.time() - response_start_time:.2f}s{timing_text}"
                 messages.append({'role': 'assistant', 'content': final_answer})  
                 if 'prompt_eval_count' in full_response_data:  
                     input_tokens += full_response_data.get('prompt_eval_count', 0)  
                 if 'eval_count' in full_response_data:  
                     output_tokens += full_response_data.get('eval_count', 0)  
+                prompt_count = full_response_data.get('prompt_eval_count')
+                completion_count = full_response_data.get('eval_count')
+                context_used = (prompt_count + completion_count
+                                if prompt_count is not None and completion_count is not None
+                                and full_response_data.get("usage_available", True) else None)
+                if context_limit is None:
+                    context_key = None  # A just-loaded Ollama model may now report its active budget.
                 if verbose_enabled and full_response_data:
                     prompt_eval_count = full_response_data.get('prompt_eval_count')
                     eval_count = full_response_data.get('eval_count')
@@ -2161,7 +2007,10 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
                     if total_duration:
                         metrics.append(f"Backend total: {total_duration / 1_000_000_000:.2f}s")
                     if metrics:
-                        metrics_panel = Panel("\n".join(metrics), title=f"[bold yellow]{chat_model.backend_label} Metrics[/bold yellow]", border_style="yellow", expand=False)
+                        metrics_panel = interface_section("\n".join(metrics), title=f"[bold yellow]{chat_model.backend_label} Metrics[/bold yellow]", border_style="yellow", expand=False)
+            thinking_text = "\n".join(part for part in (api_thinking_text, legacy_thinking_text) if part)
+            transcript[-1].update(answer=final_answer, thinking=thinking_text)
+            console.print(response_view(chat_model, final_answer, thinking_text))
             if metrics_panel:
                 console.print(metrics_panel)
   
@@ -2170,7 +2019,7 @@ def handle_chat_interaction(chat_model, is_document_chat, generation_parameters,
             if messages and messages[-1]['role'] == 'user':  
                 messages.pop()  
         except Exception as e:  
-            console.print(Panel(f"[bold red]An error occurred with {chat_model.backend_label}: {e}[/bold red]"))
+            console.print(interface_section(f"[bold red]An error occurred with {chat_model.backend_label}: {e}[/bold red]"))
   
   
 def clean_csv(input_file):  
@@ -2244,7 +2093,9 @@ def main():
         console.print("\n".join(pyfiglet.FigletFont.getFonts()))
         return
 
-    is_interactive = sys.stdout.isatty() and not args.question  
+    is_interactive = sys.stdout.isatty() and not args.question
+    if is_interactive:
+        set_terminal_background()
     generation_parameters = {}
   
     while True:  
@@ -2254,46 +2105,37 @@ def main():
         # Mode selection  
         mode = "Chat with a document" if args.file_path or args.question else "General chat"  
         if is_interactive and not args.file_path and not args.question:  
-            mode_list = """[yellow]1[/yellow]: General chat  
-[yellow]2[/yellow]: Image generation  
-[yellow]3[/yellow]: Chat with a document  
-[yellow]4[/yellow]: Clean CSV  
-[yellow]5[/yellow]: Read the README"""  
-            console.print(Panel(mode_list, title="[bold green]Choose a Mode[/bold green]", expand=True))  
-            mode_choice = IntPrompt.ask("Select a mode", choices=["1", "2", "3", "4", "5"], default=1)  
-            if mode_choice == 1:  
-                mode = "General chat"  
-            elif mode_choice == 2:  
-                mode = "Image generation"  
-            elif mode_choice == 3:  
-                mode = "Chat with a document"  
-            elif mode_choice == 4:  
-                mode = "Clean CSV"  
-            else:  
-                mode = "Read README"  
-  
+            mode_list = """[yellow]1[/yellow]: General chat
+[yellow]2[/yellow]: Chat with a document
+[yellow]3[/yellow]: Clean CSV
+[yellow]4[/yellow]: Read the README"""
+            console.print(interface_section(mode_list, title="[bold green]Choose a Mode[/bold green]", shade="selector_bg"))
+            mode_choice = IntPrompt.ask("Select a mode", choices=["1", "2", "3", "4"], default=1)
+            if mode_choice == 1:
+                mode = "General chat"
+            elif mode_choice == 2:
+                mode = "Chat with a document"
+            elif mode_choice == 3:
+                mode = "Clean CSV"
+            else:
+                mode = "Read README"
+
         if mode == "Read README":  
             try:  
                 script_dir = os.path.dirname(os.path.abspath(__file__))  
                 readme_path = os.path.join(script_dir, "README.md")  
                 with open(readme_path, "r", encoding="utf-8") as f:  
                     readme_content = f.read()  
-                console.print(Panel(Markdown(readme_content), title="[bold green]README.md[/bold green]", border_style="white", expand=True))  
-                console.print(Panel("Press Enter to return to the main menu.", style="bold yellow"))  
+                console.print(interface_section(themed_markdown(readme_content), title="[bold green]README.md[/bold green]", border_style="white", expand=True))
+                console.print(interface_section("Press Enter to return to the main menu.", style="bold yellow"))
                 Prompt.ask()  
                 continue  
             except FileNotFoundError:  
-                console.print(Panel("[bold red]README.md not found.[/bold red]"))  
+                console.print(interface_section("[bold red]README.md not found.[/bold red]"))
                 continue  
   
-        if mode == "Image generation":  
-            should_exit = handle_image_generation()  
-            if should_exit:  
-                break  
-            continue  
-  
         if mode == "Clean CSV":  
-            console.print(Panel("Select a CSV file to clean.", title="[bold green]Clean CSV Mode[/bold green]"))  
+            console.print(interface_section("Select a CSV file to clean.", title="[bold green]Clean CSV Mode[/bold green]"))
             csv_path = open_file_picker()  
             if csv_path:  
                 try:  
@@ -2302,9 +2144,9 @@ def main():
                         spinner = Spinner("dots", text=Text("Cleaning CSV...", style="yellow"))  
                         live.update(  
                             Group(  
-                                Rule(title="[bold green]Clean CSV[/bold green]", style="white"),  
+                                Text("Clean CSV", style="bold green"),
                                 Align.center(spinner),  
-                                Rule(title=Text("Time: 0.00s", style="bold yellow"), style="white", align="right"),  
+                                Text("Preparing CSV", style="yellow"),
                             ),  
                             refresh=True,  
                         )  
@@ -2325,15 +2167,15 @@ def main():
   
                     # Display confirmation panel  
                     params_text = "\n".join([f"{key}: {value}" for key, value in csv_cleaning_params.items()])  
-                    console.print(Panel(params_text, title="[bold yellow]Default Parameters for Cleaned CSV Applied[/bold yellow]", border_style="yellow", style="yellow"))  
+                    console.print(interface_section(params_text, title="[bold yellow]Default Parameters for Cleaned CSV Applied[/bold yellow]", border_style="yellow", style="yellow"))
   
-                    console.print(Panel(f"Successfully cleaned CSV and saved to [bold green]{cleaned_path}[/bold green].\nNow, select a file to chat with.", title="[green]Cleaning Complete[/green]"))  
+                    console.print(interface_section(f"Successfully cleaned CSV and saved to [bold green]{cleaned_path}[/bold green].\nNow, select a file to chat with.", title="[green]Cleaning Complete[/green]"))
                     mode = "Chat with a document" # Transition to chat with doc mode  
                 except Exception as e:  
-                    console.print(Panel(f"[bold red]Error cleaning CSV: {e}[/bold red]"))  
+                    console.print(interface_section(f"[bold red]Error cleaning CSV: {e}[/bold red]"))
                     continue  
             else:  
-                console.print(Panel("[bold yellow]No file selected. Returning to main menu.[/bold yellow]"))  
+                console.print(interface_section("[bold yellow]No file selected. Returning to main menu.[/bold yellow]"))
                 continue  
   
         if mode == "Chat with a document":  
@@ -2349,7 +2191,7 @@ def main():
 
             inactive = inactive_parameter_names(chat_model, generation_parameters)
             if inactive:
-                console.print(Panel(
+                console.print(interface_section(
                     f"Settings not supported by {chat_model.backend_label} will be inactive: {', '.join(inactive)}",
                     title="[yellow]Backend Parameters[/yellow]",
                     border_style="yellow",
@@ -2363,7 +2205,7 @@ def main():
                 else:  
                     continue  
   
-            console.print(Panel(f"Using embedding model: [bold]{embedding_model}[/bold] and chat model: [bold]{chat_model}[/bold] via {chat_model.backend_label}", title="[green]Ready[/green]", expand=False))
+            console.print(interface_section(f"Using embedding model: [bold]{embedding_model}[/bold] and chat model: [bold]{chat_model}[/bold] via {chat_model.backend_label}", title="[green]Ready[/green]", expand=False))
   
             if args.question:  
                 # Non-interactive document question  
@@ -2387,7 +2229,7 @@ def main():
                 prompt = f"{guard}\n\nContext:\n{context}\n\nQuestion: {args.question}\n"  
                   
                 response = chat_once(chat_model, [{'role': 'user', 'content': prompt}], generation_parameters)
-                console.print(Panel(Markdown(response['message']['content']), title=f"[bold green]{chat_model}[/bold green]"))  
+                console.print(interface_section(themed_markdown(response['message']['content']), title=f"[bold green]{chat_model}[/bold green]"))
                 break  
             else:  
                 should_exit = handle_chat_interaction(  
@@ -2408,13 +2250,13 @@ def main():
             if is_interactive:
                 warm_chat_model(chat_model)
               
-            console.print(Panel(f"Using model: [bold]{chat_model}[/bold] via {chat_model.backend_label}", title="[green]Ready for General Chat[/green]", expand=False))
+            console.print(interface_section(f"Using model: [bold]{chat_model}[/bold] via {chat_model.backend_label}", title="[green]Ready for General Chat[/green]", expand=False))
             should_exit = handle_chat_interaction(chat_model=chat_model, is_document_chat=False, generation_parameters=generation_parameters)
             if should_exit:  
                 break  
           
         end_time = time.time()  
-        console.print(Panel(f"Session lasted: {end_time - start_time:.2f} seconds", style="bold yellow"))  
+        console.print(interface_section(f"Session lasted: {end_time - start_time:.2f} seconds", style="bold yellow"))
           
         if not is_interactive:  
             break  
